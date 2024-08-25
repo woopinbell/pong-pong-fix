@@ -11,3 +11,7 @@ corepack enable
 pnpm install
 ```
 
+## 구성
+
+공용 데이터 형식은 `packages/shared`, PostgreSQL 스키마와 저장소 구현은 `packages/db`에 있습니다.
+
