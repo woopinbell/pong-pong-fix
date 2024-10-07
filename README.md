@@ -25,10 +25,11 @@ pnpm install
 
 ## 실행
 
-환경 변수 파일을 준비한 뒤 API 개발 서버를 실행합니다.
+Docker Compose로 PostgreSQL, API, 웹과 Caddy를 함께 시작합니다.
 
 ```sh
-cp .env.example .env
-pnpm --filter @pong-pong/api dev
+make dev
 ```
+
+웹은 `http://localhost:8080`에서 접속할 수 있습니다. 서비스를 내릴 때는 `make down`을 실행합니다.
 
