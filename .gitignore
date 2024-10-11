@@ -1,4 +1,5 @@
 node_modules/
+.pnpm-store/
 .next/
 dist/
 coverage/
@@ -8,4 +9,3 @@ playwright-report/
 .env.local
 .DS_Store
 *.log
-
