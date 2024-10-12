@@ -41,12 +41,15 @@ export class GameHub {
 
   constructor(private readonly repo: AppRepository) {}
 
-  connect(socket: WebSocket, request: IncomingMessage, user: SessionUser): void {
+  connect(socket: WebSocket, request: IncomingMessage, user: SessionUser, pendingPayloads: string[] = []): void {
     const client: Client = { id: randomUUID(), socket, user, roomId: null };
     this.clients.set(client.id, client);
     socket.on("message", (payload) => this.receive(client, payload.toString()));
     socket.on("close", () => this.disconnect(client));
     this.broadcastPresence();
+    for (const payload of pendingPayloads) {
+      this.receive(client, payload).catch(() => undefined);
+    }
   }
 
   private async receive(client: Client, payload: string): Promise<void> {
@@ -88,6 +91,7 @@ export class GameHub {
 
   private joinQueue(client: Client, mode: "queue" | "ai"): void {
     this.leaveQueue(client);
+    this.pruneQueue();
     if (mode === "ai") {
       this.createRoom(client, null, true);
       return;
@@ -104,6 +108,14 @@ export class GameHub {
   private leaveQueue(client: Client): void {
     const index = this.queue.findIndex((queued) => queued.id === client.id);
     if (index >= 0) this.queue.splice(index, 1);
+  }
+
+  private pruneQueue(): void {
+    for (let index = this.queue.length - 1; index >= 0; index -= 1) {
+      if (this.queue[index].socket.readyState !== WebSocket.OPEN) {
+        this.queue.splice(index, 1);
+      }
+    }
   }
 
   private createRoom(left: Client, right: Client | null, ai: boolean): void {

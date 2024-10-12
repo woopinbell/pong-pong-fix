@@ -24,13 +24,17 @@ export function buildApp({ repo, webOrigin }: BuildAppOptions) {
   app.register(async (realtime) => {
     await realtime.register(websocket);
     realtime.get("/ws", { websocket: true }, (socket, request) => {
+      const pendingPayloads: string[] = [];
+      const bufferPayload = (payload: Buffer) => pendingPayloads.push(payload.toString());
+      socket.on("message", bufferPayload);
       currentUser(repo, request)
         .then((user) => {
           if (!user) {
             socket.close(1008, "unauthorized");
             return;
           }
-          hub.connect(socket as WebSocket, request.raw, user);
+          socket.off("message", bufferPayload);
+          hub.connect(socket as WebSocket, request.raw, user, pendingPayloads);
         })
         .catch(() => socket.close(1011, "authentication failed"));
     });
