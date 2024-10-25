@@ -7,6 +7,11 @@ const login = await request("/auth/dev-login", {
 
 await request("/me", { headers: { authorization: `Bearer ${login.token}` } });
 await request("/lobby", { headers: { authorization: `Bearer ${login.token}` } });
+await request("/chat/lobby", {
+  method: "POST",
+  headers: { authorization: `Bearer ${login.token}` },
+  body: JSON.stringify({ body: "스모크 로비 채팅" })
+});
 await request("/leaderboard");
 await request("/dashboard", { headers: { authorization: `Bearer ${login.token}` } });
 
@@ -25,4 +30,3 @@ async function request(path, init = {}) {
   }
   return response.json();
 }
-
