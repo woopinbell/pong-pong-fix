@@ -10,6 +10,7 @@ import type {
   MatchSummary,
   PublicUser,
   SessionUser,
+  TournamentMatchSummary,
   TournamentSummary,
   UserRole,
   UserStatus
@@ -43,6 +44,17 @@ export interface CreateMatchInput {
   scoreRight: number;
 }
 
+export interface TournamentMatchRecord {
+  id: string;
+  tournamentId: string;
+  round: "semifinal" | "final";
+  slot: number;
+  status: "pending" | "ready" | "running" | "finished";
+  leftUserId: string | null;
+  rightUserId: string | null;
+  winnerId: string | null;
+}
+
 export interface AppRepository {
   close(): Promise<void>;
   ensureSeedData(): Promise<void>;
@@ -65,6 +77,9 @@ export interface AppRepository {
   listTournaments(): Promise<TournamentSummary[]>;
   createTournament(input: { name: string; createdBy: string }): Promise<TournamentSummary>;
   joinTournament(tournamentId: string, userId: string): Promise<TournamentSummary>;
+  getTournamentMatch(matchId: string): Promise<TournamentMatchRecord | null>;
+  startTournamentMatch(matchId: string, roomId: string): Promise<void>;
+  completeTournamentMatch(input: { tournamentMatchId: string; roomId: string; matchId: string; winnerId: string | null; scoreLeft: number; scoreRight: number }): Promise<TournamentSummary>;
   listAdminUsers(): Promise<PublicUser[]>;
   setUserBan(actorId: string, targetUserId: string, banned: boolean, reason: string): Promise<PublicUser>;
 }
@@ -326,6 +341,16 @@ class PostgresRepository implements AppRepository {
 
   async joinTournament(tournamentId: string, userId: string): Promise<TournamentSummary> {
     const count = await sql<{ count: string }>`select count(*)::text from tournament_entries where tournament_id = ${tournamentId}`.execute(this.db);
+    const tournament = await sql<{ capacity: number; joined: boolean }>`
+      select capacity, exists(select 1 from tournament_entries where tournament_id = ${tournamentId} and user_id = ${userId}) as joined
+      from tournaments
+      where id = ${tournamentId}
+      limit 1
+    `.execute(this.db);
+    const tournamentRow = firstRow(tournament);
+    if (!tournamentRow.joined && Number(firstRow(count).count) >= Number(tournamentRow.capacity)) {
+      throw new Error("tournament full");
+    }
     const seed = Number(firstRow(count).count) + 1;
     await sql`
       insert into tournament_entries (tournament_id, user_id, seed)
@@ -337,8 +362,47 @@ class PostgresRepository implements AppRepository {
       set status = case when (select count(*) from tournament_entries where tournament_id = ${tournamentId}) >= capacity then 'running' else status end
       where id = ${tournamentId}
     `.execute(this.db);
+    await this.ensureTournamentBracket(tournamentId);
     const tournaments = await this.listTournaments();
     const found = tournaments.find((item) => item.id === tournamentId);
+    if (!found) throw new Error("tournament not found");
+    return found;
+  }
+
+  async getTournamentMatch(matchId: string): Promise<TournamentMatchRecord | null> {
+    const result = await sql<any>`select * from tournament_matches where id = ${matchId} limit 1`.execute(this.db);
+    return result.rows[0] ? tournamentMatchRecord(result.rows[0]) : null;
+  }
+
+  async startTournamentMatch(matchId: string, roomId: string): Promise<void> {
+    await sql`
+      update tournament_matches
+      set status = 'running', room_id = ${roomId}, updated_at = now()
+      where id = ${matchId} and status in ('ready', 'running')
+    `.execute(this.db);
+  }
+
+  async completeTournamentMatch(input: { tournamentMatchId: string; roomId: string; matchId: string; winnerId: string | null; scoreLeft: number; scoreRight: number }): Promise<TournamentSummary> {
+    const updated = await sql<any>`
+      update tournament_matches
+      set status = 'finished',
+          room_id = ${input.roomId},
+          match_id = ${input.matchId},
+          winner_id = ${input.winnerId},
+          score_left = ${input.scoreLeft},
+          score_right = ${input.scoreRight},
+          updated_at = now()
+      where id = ${input.tournamentMatchId}
+      returning *
+    `.execute(this.db);
+    const row = firstRow(updated);
+    if (row.round === "semifinal") {
+      await this.ensureFinalMatch(row.tournament_id);
+    } else {
+      await sql`update tournaments set status = 'finished', winner_id = ${input.winnerId} where id = ${row.tournament_id}`.execute(this.db);
+    }
+    const tournaments = await this.listTournaments();
+    const found = tournaments.find((item) => item.id === row.tournament_id);
     if (!found) throw new Error("tournament not found");
     return found;
   }
@@ -370,6 +434,12 @@ class PostgresRepository implements AppRepository {
       where e.tournament_id = ${row.id}
       order by e.seed asc
     `.execute(this.db);
+    const matches = await sql<any>`
+      select *
+      from tournament_matches
+      where tournament_id = ${row.id}
+      order by case when round = 'semifinal' then 1 else 2 end, slot asc
+    `.execute(this.db);
     return {
       id: row.id,
       name: row.name,
@@ -388,8 +458,58 @@ class PostgresRepository implements AppRepository {
       }),
       playerCount: entries.rows.length,
       capacity: row.capacity,
-      winner: null,
-      entries: entries.rows.map((entry) => toPublicUser(entry, true))
+      winner: row.winner_id ? await this.getUserById(row.winner_id) : null,
+      entries: entries.rows.map((entry) => toPublicUser(entry, true)),
+      matches: await Promise.all(matches.rows.map((match) => this.tournamentMatchFromRow(match)))
+    };
+  }
+
+  private async ensureTournamentBracket(tournamentId: string): Promise<void> {
+    const entries = await sql<{ user_id: string; seed: number }>`
+      select user_id, seed
+      from tournament_entries
+      where tournament_id = ${tournamentId}
+      order by seed asc
+    `.execute(this.db);
+    if (entries.rows.length < 4) return;
+    await sql`
+      insert into tournament_matches (tournament_id, round, slot, left_user_id, right_user_id, status)
+      values
+        (${tournamentId}, 'semifinal', 1, ${entries.rows[0].user_id}, ${entries.rows[3].user_id}, 'ready'),
+        (${tournamentId}, 'semifinal', 2, ${entries.rows[1].user_id}, ${entries.rows[2].user_id}, 'ready')
+      on conflict (tournament_id, round, slot) do nothing
+    `.execute(this.db);
+  }
+
+  private async ensureFinalMatch(tournamentId: string): Promise<void> {
+    const semis = await sql<{ winner_id: string; slot: number }>`
+      select winner_id, slot
+      from tournament_matches
+      where tournament_id = ${tournamentId} and round = 'semifinal' and status = 'finished' and winner_id is not null
+      order by slot asc
+    `.execute(this.db);
+    if (semis.rows.length < 2) return;
+    await sql`
+      insert into tournament_matches (tournament_id, round, slot, left_user_id, right_user_id, status)
+      values (${tournamentId}, 'final', 1, ${semis.rows[0].winner_id}, ${semis.rows[1].winner_id}, 'ready')
+      on conflict (tournament_id, round, slot) do nothing
+    `.execute(this.db);
+  }
+
+  private async tournamentMatchFromRow(row: any): Promise<TournamentMatchSummary> {
+    return {
+      id: row.id,
+      tournamentId: row.tournament_id,
+      round: row.round,
+      slot: Number(row.slot),
+      status: row.status,
+      left: row.left_user_id ? await this.getUserById(row.left_user_id) : null,
+      right: row.right_user_id ? await this.getUserById(row.right_user_id) : null,
+      winner: row.winner_id ? await this.getUserById(row.winner_id) : null,
+      scoreLeft: row.score_left == null ? null : Number(row.score_left),
+      scoreRight: row.score_right == null ? null : Number(row.score_right),
+      roomId: row.room_id,
+      matchId: row.match_id
     };
   }
 }
@@ -565,7 +685,8 @@ class MemoryRepository implements AppRepository {
       playerCount: 1,
       capacity: 4,
       winner: null,
-      entries: [creator]
+      entries: [creator],
+      matches: []
     };
     this.tournaments.unshift(tournament);
     return tournament;
@@ -575,12 +696,58 @@ class MemoryRepository implements AppRepository {
     const tournament = this.tournaments.find((item) => item.id === tournamentId);
     const user = await this.getUserById(userId);
     if (!tournament || !user) throw new Error("tournament not found");
-    if (!tournament.entries.some((entry) => entry.id === user.id)) {
+    const alreadyJoined = tournament.entries.some((entry) => entry.id === user.id);
+    if (!alreadyJoined && tournament.entries.length >= tournament.capacity) {
+      throw new Error("tournament full");
+    }
+    if (!alreadyJoined) {
       tournament.entries.push(user);
     }
     tournament.playerCount = tournament.entries.length;
     tournament.status = tournament.playerCount >= tournament.capacity ? "running" : "open";
+    this.ensureMemoryBracket(tournament);
     return tournament;
+  }
+
+  async getTournamentMatch(matchId: string): Promise<TournamentMatchRecord | null> {
+    const match = this.findTournamentMatch(matchId)?.match;
+    if (!match) return null;
+    return {
+      id: match.id,
+      tournamentId: match.tournamentId,
+      round: match.round,
+      slot: match.slot,
+      status: match.status,
+      leftUserId: match.left?.id ?? null,
+      rightUserId: match.right?.id ?? null,
+      winnerId: match.winner?.id ?? null
+    };
+  }
+
+  async startTournamentMatch(matchId: string, roomId: string): Promise<void> {
+    const found = this.findTournamentMatch(matchId);
+    if (!found) throw new Error("tournament match not found");
+    found.match.status = "running";
+    found.match.roomId = roomId;
+  }
+
+  async completeTournamentMatch(input: { tournamentMatchId: string; roomId: string; matchId: string; winnerId: string | null; scoreLeft: number; scoreRight: number }): Promise<TournamentSummary> {
+    const found = this.findTournamentMatch(input.tournamentMatchId);
+    if (!found) throw new Error("tournament match not found");
+    const winner = input.winnerId ? await this.getUserById(input.winnerId) : null;
+    found.match.status = "finished";
+    found.match.roomId = input.roomId;
+    found.match.matchId = input.matchId;
+    found.match.winner = winner;
+    found.match.scoreLeft = input.scoreLeft;
+    found.match.scoreRight = input.scoreRight;
+    if (found.match.round === "semifinal") {
+      this.ensureMemoryFinal(found.tournament);
+    } else {
+      found.tournament.status = "finished";
+      found.tournament.winner = winner;
+    }
+    return found.tournament;
   }
 
   async listAdminUsers(): Promise<PublicUser[]> {
@@ -592,6 +759,29 @@ class MemoryRepository implements AppRepository {
     if (!user) throw new Error("user not found");
     user.status = banned ? "banned" : "active";
     return toPublicUser(user, true);
+  }
+
+  private ensureMemoryBracket(tournament: TournamentSummary): void {
+    if (tournament.entries.length < tournament.capacity || tournament.matches.some((match) => match.round === "semifinal")) return;
+    tournament.matches.push(
+      memoryTournamentMatch(tournament.id, "semifinal", 1, tournament.entries[0], tournament.entries[3]),
+      memoryTournamentMatch(tournament.id, "semifinal", 2, tournament.entries[1], tournament.entries[2])
+    );
+  }
+
+  private ensureMemoryFinal(tournament: TournamentSummary): void {
+    if (tournament.matches.some((match) => match.round === "final")) return;
+    const semis = tournament.matches.filter((match) => match.round === "semifinal" && match.status === "finished" && match.winner).sort((a, b) => a.slot - b.slot);
+    if (semis.length < 2) return;
+    tournament.matches.push(memoryTournamentMatch(tournament.id, "final", 1, semis[0].winner, semis[1].winner));
+  }
+
+  private findTournamentMatch(matchId: string): { tournament: TournamentSummary; match: TournamentMatchSummary } | null {
+    for (const tournament of this.tournaments) {
+      const match = tournament.matches.find((item) => item.id === matchId);
+      if (match) return { tournament, match };
+    }
+    return null;
   }
 }
 
@@ -646,6 +836,36 @@ function matchSummary(row: any, userId?: string): MatchSummary {
     scoreRight: Number(row.score_right ?? row.scoreRight),
     ratingDelta: won ? Number(row.rating_delta ?? 16) : -12,
     endedAt: new Date(row.ended_at ?? row.endedAt ?? Date.now()).toISOString()
+  };
+}
+
+function tournamentMatchRecord(row: any): TournamentMatchRecord {
+  return {
+    id: row.id,
+    tournamentId: row.tournament_id,
+    round: row.round,
+    slot: Number(row.slot),
+    status: row.status,
+    leftUserId: row.left_user_id,
+    rightUserId: row.right_user_id,
+    winnerId: row.winner_id
+  };
+}
+
+function memoryTournamentMatch(tournamentId: string, round: "semifinal" | "final", slot: number, left: PublicUser | null, right: PublicUser | null): TournamentMatchSummary {
+  return {
+    id: randomUUID(),
+    tournamentId,
+    round,
+    slot,
+    status: "ready",
+    left,
+    right,
+    winner: null,
+    scoreLeft: null,
+    scoreRight: null,
+    roomId: null,
+    matchId: null
   };
 }
 
