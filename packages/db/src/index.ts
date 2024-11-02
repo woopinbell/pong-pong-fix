@@ -5,6 +5,7 @@ import type {
   ChatMessage,
   DashboardSummary,
   FriendSummary,
+  AdminActionSummary,
   LeaderboardEntry,
   MatchMode,
   MatchSummary,
@@ -81,6 +82,7 @@ export interface AppRepository {
   startTournamentMatch(matchId: string, roomId: string): Promise<void>;
   completeTournamentMatch(input: { tournamentMatchId: string; roomId: string; matchId: string; winnerId: string | null; scoreLeft: number; scoreRight: number }): Promise<TournamentSummary>;
   listAdminUsers(): Promise<PublicUser[]>;
+  listAdminActions(): Promise<AdminActionSummary[]>;
   setUserBan(actorId: string, targetUserId: string, banned: boolean, reason: string): Promise<PublicUser>;
 }
 
@@ -412,6 +414,23 @@ class PostgresRepository implements AppRepository {
     return result.rows.map((row) => toPublicUser(row, true));
   }
 
+  async listAdminActions(): Promise<AdminActionSummary[]> {
+    const result = await sql<any>`
+      select *
+      from admin_actions
+      order by created_at desc
+      limit 30
+    `.execute(this.db);
+    return Promise.all(result.rows.map(async (row) => ({
+      id: row.id,
+      actor: row.actor_id ? await this.getUserById(row.actor_id) : null,
+      target: row.target_user_id ? await this.getUserById(row.target_user_id) : null,
+      action: row.action,
+      reason: row.reason,
+      createdAt: new Date(row.created_at).toISOString()
+    })));
+  }
+
   async setUserBan(actorId: string, targetUserId: string, banned: boolean, reason: string): Promise<PublicUser> {
     const result = await sql<RawUser>`
       update users
@@ -521,6 +540,7 @@ class MemoryRepository implements AppRepository {
   private readonly chats: ChatMessage[] = [];
   private readonly friendships: FriendSummary[] = [];
   private readonly tournaments: TournamentSummary[] = [];
+  private readonly adminActions: AdminActionSummary[] = [];
 
   async close(): Promise<void> {}
 
@@ -754,11 +774,25 @@ class MemoryRepository implements AppRepository {
     return this.listOnlineUsers();
   }
 
-  async setUserBan(_actorId: string, targetUserId: string, banned: boolean): Promise<PublicUser> {
+  async listAdminActions(): Promise<AdminActionSummary[]> {
+    return this.adminActions;
+  }
+
+  async setUserBan(actorId: string, targetUserId: string, banned: boolean, reason: string): Promise<PublicUser> {
     const user = this.users.get(targetUserId);
     if (!user) throw new Error("user not found");
     user.status = banned ? "banned" : "active";
-    return toPublicUser(user, true);
+    const actor = await this.getUserById(actorId);
+    const target = toPublicUser(user, true);
+    this.adminActions.unshift({
+      id: randomUUID(),
+      actor,
+      target,
+      action: banned ? "ban" : "unban",
+      reason,
+      createdAt: new Date().toISOString()
+    });
+    return target;
   }
 
   private ensureMemoryBracket(tournament: TournamentSummary): void {
