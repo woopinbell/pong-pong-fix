@@ -230,7 +230,7 @@ class PostgresRepository implements AppRepository {
       me: { ...user, email: null },
       recentMatches,
       winRate: percentage(user.wins, user.losses),
-      bestStreak: Math.max(1, Math.min(12, user.wins - user.losses + 3))
+      bestStreak: bestWinningStreak(recentMatches)
     };
   }
 
@@ -624,11 +624,12 @@ class MemoryRepository implements AppRepository {
   async getDashboard(userId: string): Promise<DashboardSummary> {
     const user = await this.getUserById(userId);
     if (!user) throw new Error("user not found");
+    const recentMatches = await this.listRecentMatches(userId);
     return {
       me: { ...user, email: null },
-      recentMatches: await this.listRecentMatches(userId),
+      recentMatches,
       winRate: percentage(user.wins, user.losses),
-      bestStreak: 3
+      bestStreak: bestWinningStreak(recentMatches)
     };
   }
 
@@ -857,6 +858,20 @@ function percentage(wins: number, losses: number): number {
   const total = Number(wins) + Number(losses);
   if (total === 0) return 0;
   return Math.round((Number(wins) / total) * 1000) / 10;
+}
+
+function bestWinningStreak(matches: MatchSummary[]): number {
+  let best = 0;
+  let current = 0;
+  for (const match of [...matches].reverse()) {
+    if (match.result === "win") {
+      current += 1;
+      best = Math.max(best, current);
+    } else {
+      current = 0;
+    }
+  }
+  return best;
 }
 
 function matchSummary(row: any, userId?: string): MatchSummary {
