@@ -29,6 +29,7 @@ type RawUser = {
   rating: number;
   wins: number;
   losses: number;
+  is_npc: boolean;
 };
 
 export interface DevLoginInput {
@@ -36,6 +37,20 @@ export interface DevLoginInput {
   displayName: string;
   email?: string | null;
 }
+
+type NpcSeed = {
+  handle: string;
+  displayName: string;
+  rating: number;
+  avatarKey: string;
+};
+
+const NPC_PLAYERS: NpcSeed[] = [
+  { handle: "npc-rally-1100", displayName: "AI 랠리 1100", rating: 1100, avatarKey: "green" },
+  { handle: "npc-block-1200", displayName: "AI 블록 1200", rating: 1200, avatarKey: "blue" },
+  { handle: "npc-spin-1300", displayName: "AI 스핀 1300", rating: 1300, avatarKey: "amber" },
+  { handle: "npc-smash-1400", displayName: "AI 스매시 1400", rating: 1400, avatarKey: "rose" }
+];
 
 export interface CreateMatchInput {
   mode: MatchMode;
@@ -66,6 +81,7 @@ export interface AppRepository {
   getUserByHandle(handle: string): Promise<PublicUser | null>;
   updateProfile(userId: string, input: { displayName?: string; avatarKey?: string }): Promise<SessionUser>;
   listOnlineUsers(): Promise<PublicUser[]>;
+  listNpcOpponents(): Promise<PublicUser[]>;
   listLeaderboard(): Promise<LeaderboardEntry[]>;
   listRecentMatches(userId?: string): Promise<MatchSummary[]>;
   getDashboard(userId: string): Promise<DashboardSummary>;
@@ -119,6 +135,9 @@ class PostgresRepository implements AppRepository {
     for (const player of players) {
       await this.upsertDevUser(player);
     }
+    for (const npc of NPC_PLAYERS) {
+      await this.upsertNpc(npc);
+    }
     await sql`update users set role = 'admin', rating = 1680 where handle = 'admin'`.execute(this.db);
     await sql`update users set rating = 1723, wins = 32, losses = 11 where handle = 'spin-doctor'`.execute(this.db);
     await sql`update users set rating = 1640, wins = 24, losses = 13 where handle = 'paddle-pro'`.execute(this.db);
@@ -131,14 +150,28 @@ class PostgresRepository implements AppRepository {
     const email = input.email ?? `${handle}@dev.pong-pong.local`;
     const displayName = input.displayName.trim() || handle;
     const result = await sql<RawUser>`
-      insert into users (email, handle, display_name, avatar_key, role)
-      values (${email}, ${handle}, ${displayName}, ${avatarFor(handle)}, ${handle === "admin" ? "admin" : "user"})
+      insert into users (email, handle, display_name, avatar_key, role, is_npc)
+      values (${email}, ${handle}, ${displayName}, ${avatarFor(handle)}, ${handle === "admin" ? "admin" : "user"}, false)
       on conflict (handle) do update set
         email = excluded.email,
-        display_name = excluded.display_name
+        display_name = excluded.display_name,
+        is_npc = false
       returning *
     `.execute(this.db);
     return toSessionUser(firstRow(result));
+  }
+
+  private async upsertNpc(input: NpcSeed): Promise<void> {
+    await sql`
+      insert into users (email, handle, display_name, avatar_key, role, status, rating, wins, losses, is_npc)
+      values (null, ${input.handle}, ${input.displayName}, ${input.avatarKey}, 'user', 'active', ${input.rating}, 0, 0, true)
+      on conflict (handle) do update set
+        display_name = excluded.display_name,
+        avatar_key = excluded.avatar_key,
+        status = 'active',
+        rating = excluded.rating,
+        is_npc = true
+    `.execute(this.db);
   }
 
   async createSession(userId: string): Promise<string> {
@@ -191,11 +224,16 @@ class PostgresRepository implements AppRepository {
     return result.rows.map((row) => toPublicUser(row, true));
   }
 
+  async listNpcOpponents(): Promise<PublicUser[]> {
+    const result = await sql<RawUser>`select * from users where status = 'active' and is_npc = true order by rating asc`.execute(this.db);
+    return result.rows.map((row) => toPublicUser(row, false));
+  }
+
   async listLeaderboard(): Promise<LeaderboardEntry[]> {
     const result = await sql<RawUser>`select * from users order by rating desc, wins desc limit 20`.execute(this.db);
     return result.rows.map((row, index) => ({
       rank: index + 1,
-      user: toPublicUser(row, true),
+      user: toPublicUser(row, false),
       winRate: percentage(row.wins, row.losses)
     }));
   }
@@ -286,7 +324,7 @@ class PostgresRepository implements AppRepository {
 
   async listLobbyChat(): Promise<ChatMessage[]> {
     const result = await sql<any>`
-      select c.*, u.id as user_id, u.email, u.handle, u.display_name, u.avatar_key, u.role, u.status, u.rating, u.wins, u.losses
+      select c.*, u.id as user_id, u.email, u.handle, u.display_name, u.avatar_key, u.role, u.status, u.rating, u.wins, u.losses, u.is_npc
       from chat_messages c
       join users u on u.id = c.sender_id
       where c.scope = 'lobby'
@@ -317,7 +355,7 @@ class PostgresRepository implements AppRepository {
 
   async listTournaments(): Promise<TournamentSummary[]> {
     const result = await sql<any>`
-      select t.*, u.id as creator_id, u.email, u.handle, u.display_name, u.avatar_key, u.role, u.status as user_status, u.rating, u.wins, u.losses
+      select t.*, u.id as creator_id, u.email, u.handle, u.display_name, u.avatar_key, u.role, u.status as user_status, u.rating, u.wins, u.losses, u.is_npc
       from tournaments t
       join users u on u.id = t.created_by
       order by t.created_at desc
@@ -473,7 +511,8 @@ class PostgresRepository implements AppRepository {
         status: row.user_status,
         rating: row.rating,
         wins: row.wins,
-        losses: row.losses
+        losses: row.losses,
+        is_npc: row.is_npc
       }),
       playerCount: entries.rows.length,
       capacity: row.capacity,
@@ -553,6 +592,28 @@ class MemoryRepository implements AppRepository {
     ]) {
       await this.upsertDevUser(player);
     }
+    for (const npc of NPC_PLAYERS) {
+      const existing = [...this.users.values()].find((user) => user.handle === npc.handle);
+      const user: RawUser = existing ?? {
+        id: randomUUID(),
+        email: null,
+        handle: npc.handle,
+        display_name: npc.displayName,
+        avatar_key: npc.avatarKey,
+        role: "user",
+        status: "active",
+        rating: npc.rating,
+        wins: 0,
+        losses: 0,
+        is_npc: true
+      };
+      user.display_name = npc.displayName;
+      user.avatar_key = npc.avatarKey;
+      user.rating = npc.rating;
+      user.status = "active";
+      user.is_npc = true;
+      this.users.set(user.id, user);
+    }
   }
 
   async upsertDevUser(input: DevLoginInput): Promise<SessionUser> {
@@ -568,9 +629,11 @@ class MemoryRepository implements AppRepository {
       status: "active",
       rating: handle === "admin" ? 1680 : 1200,
       wins: 0,
-      losses: 0
+      losses: 0,
+      is_npc: false
     };
     user.display_name = input.displayName || user.display_name;
+    user.is_npc = false;
     this.users.set(user.id, user);
     return toSessionUser(user, true);
   }
@@ -609,8 +672,17 @@ class MemoryRepository implements AppRepository {
     return [...this.users.values()].sort((a, b) => b.rating - a.rating).map((user) => toPublicUser(user, true));
   }
 
+  async listNpcOpponents(): Promise<PublicUser[]> {
+    return [...this.users.values()]
+      .filter((user) => user.is_npc && user.status === "active")
+      .sort((a, b) => a.rating - b.rating)
+      .map((user) => toPublicUser(user, false));
+  }
+
   async listLeaderboard(): Promise<LeaderboardEntry[]> {
-    return (await this.listOnlineUsers()).map((user, index) => ({ rank: index + 1, user, winRate: percentage(user.wins, user.losses) }));
+    return [...this.users.values()]
+      .sort((a, b) => b.rating - a.rating || b.wins - a.wins)
+      .map((user, index) => ({ rank: index + 1, user: toPublicUser(user, false), winRate: percentage(user.wins, user.losses) }));
   }
 
   async listRecentMatches(userId?: string): Promise<MatchSummary[]> {
@@ -846,7 +918,8 @@ function toPublicUser(row: RawUser, online = false): PublicUser {
     rating: Number(row.rating),
     wins: Number(row.wins),
     losses: Number(row.losses),
-    online
+    online,
+    isNpc: Boolean(row.is_npc)
   };
 }
 
@@ -933,7 +1006,8 @@ function chatRow(row: any): ChatMessage {
       status: row.status,
       rating: row.rating,
       wins: row.wins,
-      losses: row.losses
+      losses: row.losses,
+      is_npc: row.is_npc
     }),
     body: row.body,
     createdAt: new Date(row.created_at).toISOString()
