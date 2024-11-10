@@ -30,6 +30,7 @@ type Client = {
 type QueueEntry = {
   client: Client;
   queuedAt: number;
+  npcFallbackTimer: NodeJS.Timeout | null;
 };
 
 type Room = {
@@ -41,11 +42,22 @@ type Room = {
   timer: NodeJS.Timeout | null;
   mode: MatchMode;
   tournamentMatchId: string | null;
+  npcUser: PublicUser | null;
+  aiTargetY: number;
 };
 
 const INITIAL_BALL_VELOCITY = { x: 10, y: 5 };
 const BALL_ACCELERATION_PER_TICK = 0.015;
 const MAX_BALL_SPEED = 18;
+const NPC_QUEUE_FALLBACK_MS = 6000;
+
+type AiProfile = {
+  reactionTicks: number;
+  predictionNoise: number;
+  mistakeChance: number;
+  paddleSpeedMultiplier: number;
+  deadZone: number;
+};
 
 export class GameHub {
   private readonly clients = new Map<string, Client>();
@@ -70,7 +82,7 @@ export class GameHub {
   private async receive(client: Client, payload: string): Promise<void> {
     try {
       const event = parseClientEvent(payload);
-      if (event.type === "queue.join") this.joinQueue(client, event.mode);
+      if (event.type === "queue.join") await this.joinQueue(client, event.mode);
       if (event.type === "queue.leave") this.leaveQueue(client);
       if (event.type === "tournament.join") await this.joinTournamentMatch(client, event.matchId);
       if (event.type === "game.ready") this.markReady(client, event.roomId);
@@ -108,7 +120,7 @@ export class GameHub {
     this.broadcastPresence();
   }
 
-  private joinQueue(client: Client, mode: "queue" | "ai"): void {
+  private async joinQueue(client: Client, mode: "queue" | "ai"): Promise<void> {
     this.leaveQueue(client);
     this.pruneQueue();
     if (mode === "ai") {
@@ -117,13 +129,45 @@ export class GameHub {
     }
     const opponentIndex = this.findClosestQueuedOpponent(client);
     if (opponentIndex < 0) {
-      this.queue.push({ client, queuedAt: Date.now() });
+      const entry: QueueEntry = { client, queuedAt: Date.now(), npcFallbackTimer: null };
+      entry.npcFallbackTimer = setTimeout(() => {
+        this.matchQueuedClientWithNpc(entry).catch((error) => {
+          this.send(client, { type: "error", message: error instanceof Error ? error.message : "AI 상대를 찾지 못했습니다." });
+        });
+      }, NPC_QUEUE_FALLBACK_MS);
+      this.queue.push(entry);
       this.broadcastPresence();
       return;
     }
     const [opponent] = this.queue.splice(opponentIndex, 1);
+    clearQueueTimer(opponent);
     this.recordWaitSample(opponent.queuedAt);
     this.createRoom(opponent.client, client, { ai: false, mode: "queue" });
+  }
+
+  private async matchQueuedClientWithNpc(entry: QueueEntry): Promise<void> {
+    const index = this.queue.findIndex((queued) => queued.client.id === entry.client.id);
+    if (index < 0 || entry.client.socket.readyState !== WebSocket.OPEN || entry.client.roomId) return;
+    const npc = await this.findClosestNpc(entry.client);
+    if (!npc) return;
+    const [queued] = this.queue.splice(index, 1);
+    clearQueueTimer(queued);
+    this.recordWaitSample(queued.queuedAt);
+    this.createRoom(queued.client, null, { ai: true, mode: "queue", npc });
+  }
+
+  private async findClosestNpc(client: Client): Promise<PublicUser | null> {
+    const npcs = await this.repo.listNpcOpponents();
+    let closest: PublicUser | null = null;
+    let closestDistance = Number.POSITIVE_INFINITY;
+    for (const npc of npcs) {
+      const distance = Math.abs(npc.rating - client.user.rating);
+      if (distance < closestDistance) {
+        closest = npc;
+        closestDistance = distance;
+      }
+    }
+    return closest;
   }
 
   private async joinTournamentMatch(client: Client, matchId: string): Promise<void> {
@@ -173,7 +217,10 @@ export class GameHub {
 
   private leaveQueue(client: Client): void {
     const index = this.queue.findIndex((queued) => queued.client.id === client.id);
-    if (index >= 0) this.queue.splice(index, 1);
+    if (index >= 0) {
+      const [entry] = this.queue.splice(index, 1);
+      clearQueueTimer(entry);
+    }
   }
 
   private leaveTournamentWaiters(client: Client): void {
@@ -187,7 +234,8 @@ export class GameHub {
   private pruneQueue(): void {
     for (let index = this.queue.length - 1; index >= 0; index -= 1) {
       if (this.queue[index].client.socket.readyState !== WebSocket.OPEN) {
-        this.queue.splice(index, 1);
+        const [entry] = this.queue.splice(index, 1);
+        clearQueueTimer(entry);
       }
     }
   }
@@ -223,8 +271,10 @@ export class GameHub {
     }
   }
 
-  private createRoom(left: Client, right: Client | null, options: { ai: boolean; mode: MatchMode; tournamentMatchId?: string | null }): string {
+  private createRoom(left: Client, right: Client | null, options: { ai: boolean; mode: MatchMode; tournamentMatchId?: string | null; npc?: PublicUser | null }): string {
     const roomId = randomUUID();
+    const npcUser = options.npc ?? null;
+    const rightPlayer = right?.user ?? npcUser;
     const room: Room = {
       id: roomId,
       clients: { left, ...(right ? { right } : {}) },
@@ -233,6 +283,8 @@ export class GameHub {
       timer: null,
       mode: options.mode,
       tournamentMatchId: options.tournamentMatchId ?? null,
+      npcUser,
+      aiTargetY: GAME_HEIGHT / 2,
       snapshot: {
         roomId,
         phase: "waiting",
@@ -250,9 +302,9 @@ export class GameHub {
         players: [
           { id: left.user.id, handle: left.user.handle, displayName: left.user.displayName, side: "left", ready: false, ai: false },
           {
-            id: right?.user.id ?? "ai-opponent",
-            handle: right?.user.handle ?? "ai",
-            displayName: right?.user.displayName ?? "연습 AI",
+            id: rightPlayer?.id ?? "ai-opponent",
+            handle: rightPlayer?.handle ?? "ai",
+            displayName: rightPlayer?.displayName ?? "연습 AI",
             side: "right",
             ready: options.ai,
             ai: options.ai
@@ -264,7 +316,7 @@ export class GameHub {
     this.rooms.set(roomId, room);
     left.roomId = roomId;
     if (right) right.roomId = roomId;
-    this.send(left, { type: "queue.matched", roomId, side: "left", opponent: right?.user.displayName ?? "연습 AI" });
+    this.send(left, { type: "queue.matched", roomId, side: "left", opponent: rightPlayer?.displayName ?? "연습 AI" });
     if (right) this.send(right, { type: "queue.matched", roomId, side: "right", opponent: left.user.displayName });
     this.broadcastRoom(roomId, { type: "game.snapshot", snapshot: room.snapshot });
     this.broadcastPresence();
@@ -325,10 +377,10 @@ export class GameHub {
     const speed = 13;
     state.paddles.left.y = clamp(state.paddles.left.y + state.paddles.left.dy * speed, 16, GAME_HEIGHT - PADDLE_HEIGHT - 16);
     if (room.ai) {
-      const center = state.paddles.right.y + PADDLE_HEIGHT / 2;
-      state.paddles.right.dy = state.ball.position.y > center + 14 ? 1 : state.ball.position.y < center - 14 ? -1 : 0;
+      updateAiPaddleIntent(room);
     }
-    state.paddles.right.y = clamp(state.paddles.right.y + state.paddles.right.dy * speed, 16, GAME_HEIGHT - PADDLE_HEIGHT - 16);
+    const rightSpeed = room.ai ? speed * aiProfileFor(room.npcUser?.rating ?? 1200).paddleSpeedMultiplier : speed;
+    state.paddles.right.y = clamp(state.paddles.right.y + state.paddles.right.dy * rightSpeed, 16, GAME_HEIGHT - PADDLE_HEIGHT - 16);
 
     state.ball.position.x += state.ball.velocity.x;
     state.ball.position.y += state.ball.velocity.y;
@@ -358,12 +410,14 @@ export class GameHub {
     if (room.timer) clearInterval(room.timer);
     room.timer = null;
     room.snapshot.phase = "finished";
-    const winner = winnerSide === "left" ? room.clients.left : room.clients.right;
-    const loser = winnerSide === "left" ? room.clients.right : room.clients.left;
+    const leftUser = room.clients.left?.user ?? null;
+    const rightUser = room.clients.right?.user ?? room.npcUser ?? null;
+    const winner = winnerSide === "left" ? leftUser : rightUser;
+    const loser = winnerSide === "left" ? rightUser : leftUser;
     const matchId = await this.repo.createMatch({
       mode: room.mode,
-      winnerId: winner?.user.id ?? null,
-      loserId: loser?.user.id ?? null,
+      winnerId: winner?.id ?? null,
+      loserId: loser?.id ?? null,
       scoreLeft: room.snapshot.leftScore,
       scoreRight: room.snapshot.rightScore
     });
@@ -381,7 +435,7 @@ export class GameHub {
         tournamentMatchId: room.tournamentMatchId,
         roomId: room.id,
         matchId,
-        winnerId: winner?.user.id ?? null,
+        winnerId: winner?.id ?? null,
         scoreLeft: room.snapshot.leftScore,
         scoreRight: room.snapshot.rightScore
       });
@@ -426,8 +480,73 @@ function sideFor(room: Room, client: Client): PlayerSide | null {
   return null;
 }
 
+function clearQueueTimer(entry: QueueEntry): void {
+  if (entry.npcFallbackTimer) {
+    clearTimeout(entry.npcFallbackTimer);
+    entry.npcFallbackTimer = null;
+  }
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function updateAiPaddleIntent(room: Room): void {
+  const state = room.snapshot;
+  const profile = aiProfileFor(room.npcUser?.rating ?? 1200);
+  if (state.tick % profile.reactionTicks === 0) {
+    const targetBase = state.ball.velocity.x > 0 ? predictedBallY(state) : GAME_HEIGHT / 2;
+    const noise = signedDeterministic(room.id, state.tick, 1) * profile.predictionNoise;
+    const mistake = deterministicUnit(room.id, state.tick, 2) < profile.mistakeChance;
+    const mistakeOffset = mistake ? signedDeterministic(room.id, state.tick, 3) * 110 : 0;
+    room.aiTargetY = clamp(targetBase + noise + mistakeOffset, 16 + PADDLE_HEIGHT / 2, GAME_HEIGHT - 16 - PADDLE_HEIGHT / 2);
+  }
+  const center = state.paddles.right.y + PADDLE_HEIGHT / 2;
+  state.paddles.right.dy = room.aiTargetY > center + profile.deadZone ? 1 : room.aiTargetY < center - profile.deadZone ? -1 : 0;
+}
+
+function aiProfileFor(rating: number): AiProfile {
+  if (rating >= 1400) {
+    return { reactionTicks: 3, predictionNoise: 20, mistakeChance: 0.04, paddleSpeedMultiplier: 1.05, deadZone: 10 };
+  }
+  if (rating >= 1300) {
+    return { reactionTicks: 4, predictionNoise: 34, mistakeChance: 0.08, paddleSpeedMultiplier: 0.96, deadZone: 14 };
+  }
+  if (rating >= 1200) {
+    return { reactionTicks: 6, predictionNoise: 54, mistakeChance: 0.12, paddleSpeedMultiplier: 0.86, deadZone: 18 };
+  }
+  return { reactionTicks: 8, predictionNoise: 78, mistakeChance: 0.18, paddleSpeedMultiplier: 0.74, deadZone: 24 };
+}
+
+function predictedBallY(state: GameSnapshot): number {
+  if (state.ball.velocity.x <= 0) return state.ball.position.y;
+  const distance = GAME_WIDTH - 32 - state.ball.position.x;
+  const ticks = distance / Math.max(1, state.ball.velocity.x);
+  let y = state.ball.position.y + state.ball.velocity.y * ticks;
+  const min = BALL_RADIUS;
+  const max = GAME_HEIGHT - BALL_RADIUS;
+  while (y < min || y > max) {
+    if (y < min) y = min + (min - y);
+    if (y > max) y = max - (y - max);
+  }
+  return y;
+}
+
+function deterministicUnit(seed: string, tick: number, salt: number): number {
+  const value = Math.sin(hashString(seed) * 0.001 + tick * 12.9898 + salt * 78.233) * 43758.5453;
+  return value - Math.floor(value);
+}
+
+function signedDeterministic(seed: string, tick: number, salt: number): number {
+  return deterministicUnit(seed, tick, salt) * 2 - 1;
+}
+
+function hashString(value: string): number {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
 }
 
 function resetBall(state: GameSnapshot, xDirection: 1 | -1): void {
