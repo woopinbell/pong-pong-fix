@@ -10,8 +10,10 @@
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "migrate": "tsx src/cli.ts migrate",
-    "seed": "tsx src/cli.ts seed",
-    "test": "vitest run --passWithNoTests"
+    "seed:dev": "tsx src/cli.ts seed:dev",
+    "seed:demo": "tsx src/cli.ts seed:demo",
+    "memory-smoke": "tsx src/cli.ts memory-smoke",
+    "test": "vitest run"
   },
   "dependencies": {
     "@pong-pong/shared": "workspace:*",
