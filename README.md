@@ -35,3 +35,16 @@ make dev
 
 웹은 `http://localhost:8080`에서 접속할 수 있습니다. 서비스를 내릴 때는 `make down`을 실행합니다.
 
+## 검증
+
+정적 검사와 단위 검사부터 실행한 뒤 실제 HTTP·WebSocket 프로세스와 브라우저 흐름을 확인합니다.
+
+```sh
+pnpm typecheck
+pnpm unit
+pnpm build
+pnpm smoke:http
+pnpm smoke:ws
+pnpm e2e
+```
+
