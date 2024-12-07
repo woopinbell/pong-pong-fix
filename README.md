@@ -42,9 +42,12 @@ make dev
 ```sh
 pnpm typecheck
 pnpm unit
+pnpm postgres-integration
 pnpm build
 pnpm smoke:http
 pnpm smoke:ws
 pnpm e2e
 ```
+
+`pnpm postgres-integration`은 Testcontainers로 실제 PostgreSQL 경계를 검사합니다.
 
