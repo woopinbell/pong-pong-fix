@@ -1,26 +1,40 @@
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
-import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
+import Fastify, { type FastifyRequest } from "fastify";
 import type { AppRepository } from "@pong-pong/db";
+import * as http from "@pong-pong/shared";
 import type { SessionUser } from "@pong-pong/shared";
 import type { WebSocket } from "ws";
 import { GameHub } from "./gameHub";
+import {
+  forbidden,
+  installHttpErrorBoundary,
+  notFound,
+  parseInput,
+  parseOutput,
+  suspended,
+  unauthorized
+} from "./httpBoundary";
+
+export type AppMode = "development" | "test" | "production" | "demo";
 
 export interface BuildAppOptions {
   repo: AppRepository;
   webOrigin: string;
+  appMode?: AppMode;
 }
 
-export function buildApp({ repo, webOrigin }: BuildAppOptions) {
+export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppOptions) {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
   const hub = new GameHub(repo);
 
+  installHttpErrorBoundary(app);
   app.register(cors, {
     origin: [webOrigin, "http://localhost:3000", "http://localhost:8080"],
     credentials: true,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["content-type", "authorization"]
+    allowedHeaders: ["content-type", "x-request-id"]
   });
   app.register(cookie);
   app.register(async (realtime) => {
@@ -46,217 +60,218 @@ export function buildApp({ repo, webOrigin }: BuildAppOptions) {
     });
   });
 
-  app.get("/health", async () => ({ ok: true, service: "pong-pong-api" }));
+  app.get("/health", async () => parseOutput(http.healthResponseSchema, {
+    ok: true,
+    service: "pong-pong-api"
+  }));
 
-  app.post("/auth/dev-login", async (request, reply) => {
-    const body = request.body as { handle?: string; displayName?: string; email?: string };
-    const user = await repo.upsertDevUser({
-      handle: body.handle ?? "player",
-      displayName: body.displayName ?? body.handle ?? "플레이어",
-      email: body.email
+  if (appMode === "development" || appMode === "test") {
+    app.post("/auth/dev-login", async (request, reply) => {
+      const body = parseInput(http.devLoginBodySchema, request.body);
+      const user = await repo.upsertDevUser(body);
+      const token = await repo.createSession(user.id);
+      reply.setCookie("pp_session", token, {
+        path: "/",
+        sameSite: "lax",
+        httpOnly: true,
+        secure: useSecureCookies(appMode),
+        maxAge: 60 * 60 * 24 * 14
+      });
+      return parseOutput(http.userResponseSchema, { user });
     });
-    const token = await repo.createSession(user.id);
-    reply.setCookie("pp_session", token, {
-      path: "/",
-      sameSite: "lax",
-      httpOnly: true,
-      maxAge: 60 * 60 * 24 * 14
-    });
-    return { user, token };
-  });
+  }
 
   app.post("/auth/logout", async (request, reply) => {
     await repo.deleteSession(readSessionToken(request));
     reply.clearCookie("pp_session", { path: "/" });
-    return { ok: true };
+    return parseOutput(http.okResponseSchema, { ok: true });
   });
 
-  app.get("/me", async (request, reply) => {
+  app.get("/me", async (request) => {
     const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    return { user };
+    if (!user) unauthorized();
+    return parseOutput(http.userResponseSchema, { user });
   });
 
-  app.get("/auth/me", async (request, reply) => {
+  app.get("/auth/me", async (request) => {
     const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    return { user };
+    if (!user) unauthorized();
+    return parseOutput(http.userResponseSchema, { user });
   });
 
-  app.get("/users/:id", async (request, reply) => {
-    const { id } = request.params as { id: string };
+  app.get("/users/:id", async (request) => {
+    const { id } = parseInput(http.idParamsSchema, request.params);
     const user = await repo.getUserById(id);
-    if (!user) return reply.code(404).send({ message: "not_found" });
-    return { user };
+    if (!user) notFound("사용자를 찾을 수 없습니다.");
+    return parseOutput(http.publicUserResponseSchema, { user });
   });
 
   app.get("/lobby", async (request) => {
     const user = await currentUser(repo, request);
-    return {
+    return parseOutput(http.lobbyResponseSchema, {
       me: user,
       onlinePlayers: hub.onlinePlayers(),
       recentMatches: await repo.listRecentMatches(user?.id),
       chat: await repo.listLobbyChat(),
       stats: hub.liveStats()
-    };
+    });
   });
 
-  app.post("/chat/lobby", async (request, reply) => {
+  app.post("/chat/lobby", async (request) => {
     const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    if (!isActive(user)) return suspended(reply);
-    const body = (request.body ?? {}) as { body?: string };
-    const messageBody = body.body?.trim() ?? "";
-    if (!messageBody) return reply.code(400).send({ message: "메시지를 입력해주세요." });
-    if (messageBody.length > 240) return reply.code(400).send({ message: "메시지는 240자 이내로 입력해주세요." });
-    return {
+    if (!user) unauthorized();
+    if (!isActive(user)) suspended();
+    const body = parseInput(http.chatBodySchema, request.body);
+    return parseOutput(http.chatResponseSchema, {
       message: await repo.createChatMessage({
         scope: "lobby",
         roomId: null,
         senderId: user.id,
-        body: messageBody
+        body: body.body
       })
-    };
+    });
   });
 
-  app.get("/leaderboard", async () => ({ entries: await repo.listLeaderboard() }));
+  app.get("/leaderboard", async () => parseOutput(http.leaderboardResponseSchema, {
+    entries: await repo.listLeaderboard()
+  }));
 
-  app.get("/dashboard", async (request, reply) => {
+  app.get("/dashboard", async (request) => {
     const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    return await repo.getDashboard(user.id);
+    if (!user) unauthorized();
+    return parseOutput(http.dashboardSummarySchema, await repo.getDashboard(user.id));
   });
 
-  app.get("/profile/:handle", async (request, reply) => {
-    const { handle } = request.params as { handle: string };
+  app.get("/profile/:handle", async (request) => {
+    const { handle } = parseInput(http.handleParamsSchema, request.params);
     const user = await repo.getUserByHandle(handle);
-    if (!user) return reply.code(404).send({ message: "프로필을 찾을 수 없습니다." });
-    return {
+    if (!user) notFound("프로필을 찾을 수 없습니다.");
+    return parseOutput(http.profileResponseSchema, {
       user,
       recentMatches: await repo.listRecentMatches(user.id)
-    };
+    });
   });
 
-  app.get("/profile/me", async (request, reply) => {
+  app.get("/profile/me", async (request) => {
     const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    return { profile: user };
+    if (!user) unauthorized();
+    return parseOutput(http.ownProfileResponseSchema, { profile: user });
   });
 
-  app.patch("/profile/me", async (request, reply) => {
+  app.patch("/profile/me", async (request) => {
     const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    const body = request.body as { displayName?: string; avatarKey?: string };
-    return {
-      profile: await repo.updateProfile(user.id, {
-        displayName: body.displayName,
-        avatarKey: body.avatarKey
-      })
-    };
+    if (!user) unauthorized();
+    const body = parseInput(http.profileUpdateBodySchema, request.body);
+    return parseOutput(http.ownProfileResponseSchema, {
+      profile: await repo.updateProfile(user.id, body)
+    });
   });
 
-  app.get("/friends", async (request, reply) => {
+  app.get("/friends", async (request) => {
     const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    return { friends: await repo.listFriends(user.id) };
+    if (!user) unauthorized();
+    return parseOutput(http.friendsResponseSchema, { friends: await repo.listFriends(user.id) });
   });
 
-  app.post("/friends/request", async (request, reply) => {
+  const requestFriend = async (request: FastifyRequest) => {
     const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    if (!isActive(user)) return suspended(reply);
-    const body = request.body as { handle?: string };
-    return { friend: await repo.requestFriend(user.id, body.handle ?? "") };
+    if (!user) unauthorized();
+    if (!isActive(user)) suspended();
+    const body = parseInput(http.friendRequestBodySchema, request.body);
+    return parseOutput(http.friendResponseSchema, {
+      friend: await repo.requestFriend(user.id, body.handle)
+    });
+  };
+
+  app.post("/friends/request", requestFriend);
+  app.post("/friends", requestFriend);
+
+  app.post("/friends/:id/accept", async (request) => {
+    const user = await currentUser(repo, request);
+    if (!user) unauthorized();
+    const { id } = parseInput(http.idParamsSchema, request.params);
+    return parseOutput(http.friendResponseSchema, { friend: await repo.acceptFriend(user.id, id) });
   });
 
-  app.post("/friends", async (request, reply) => {
+  app.get("/tournaments", async () => parseOutput(http.tournamentsResponseSchema, {
+    tournaments: await repo.listTournaments()
+  }));
+
+  app.post("/tournaments", async (request) => {
     const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    if (!isActive(user)) return suspended(reply);
-    const body = request.body as { handle?: string };
-    return { friend: await repo.requestFriend(user.id, body.handle ?? "") };
+    if (!user) unauthorized();
+    if (!isActive(user)) suspended();
+    const body = parseInput(http.tournamentCreateBodySchema, request.body);
+    return parseOutput(http.tournamentResponseSchema, {
+      tournament: await repo.createTournament({ name: body.name, createdBy: user.id })
+    });
   });
 
-  app.post("/friends/:id/accept", async (request, reply) => {
+  app.post("/tournaments/:id/join", async (request) => {
     const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    const { id } = request.params as { id: string };
-    return { friend: await repo.acceptFriend(user.id, id) };
+    if (!user) unauthorized();
+    if (!isActive(user)) suspended();
+    const { id } = parseInput(http.idParamsSchema, request.params);
+    return parseOutput(http.tournamentResponseSchema, { tournament: await repo.joinTournament(id, user.id) });
   });
 
-  app.get("/tournaments", async () => ({ tournaments: await repo.listTournaments() }));
-
-  app.post("/tournaments", async (request, reply) => {
-    const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    if (!isActive(user)) return suspended(reply);
-    const body = request.body as { name?: string };
-    return { tournament: await repo.createTournament({ name: body.name ?? "퐁퐁 주간 컵", createdBy: user.id }) };
+  app.get("/admin/users", async (request) => {
+    const user = await requireAdmin(repo, request);
+    return parseOutput(http.adminUsersResponseSchema, { users: await repo.listAdminUsers() });
   });
 
-  app.post("/tournaments/:id/join", async (request, reply) => {
-    const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    if (!isActive(user)) return suspended(reply);
-    const { id } = request.params as { id: string };
-    return { tournament: await repo.joinTournament(id, user.id) };
+  app.get("/admin/actions", async (request) => {
+    await requireAdmin(repo, request);
+    return parseOutput(http.adminActionsResponseSchema, { actions: await repo.listAdminActions() });
   });
 
-  app.get("/admin/users", async (request, reply) => {
-    const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    if (user.role !== "admin") return reply.code(403).send({ message: "운영자 권한이 필요합니다." });
-    return { users: await repo.listAdminUsers() };
+  app.post("/admin/users/:id/ban", async (request) => {
+    const user = await requireAdmin(repo, request);
+    const { id } = parseInput(http.idParamsSchema, request.params);
+    const body = parseInput(http.adminBanBodySchema, request.body ?? {});
+    return parseOutput(http.publicUserResponseSchema, {
+      user: await repo.setUserBan(user.id, id, body.banned ?? true, body.reason ?? "manual review")
+    });
   });
 
-  app.get("/admin/actions", async (request, reply) => {
-    const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    if (user.role !== "admin") return reply.code(403).send({ message: "운영자 권한이 필요합니다." });
-    return { actions: await repo.listAdminActions() };
-  });
-
-  app.post("/admin/users/:id/ban", async (request, reply) => {
-    const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    if (user.role !== "admin") return reply.code(403).send({ message: "운영자 권한이 필요합니다." });
-    const { id } = request.params as { id: string };
-    const body = request.body as { banned?: boolean; reason?: string };
-    return { user: await repo.setUserBan(user.id, id, body.banned ?? true, body.reason ?? "manual review") };
-  });
-
-  app.patch("/admin/users/:id/status", async (request, reply) => {
-    const user = await currentUser(repo, request);
-    if (!user) return unauthorized(reply);
-    if (user.role !== "admin") return reply.code(403).send({ message: "운영자 권한이 필요합니다." });
-    const { id } = request.params as { id: string };
-    const body = request.body as { status?: "active" | "banned"; reason?: string };
-    return { user: await repo.setUserBan(user.id, id, body.status === "banned", body.reason ?? "manual review") };
+  app.patch("/admin/users/:id/status", async (request) => {
+    const user = await requireAdmin(repo, request);
+    const { id } = parseInput(http.idParamsSchema, request.params);
+    const body = parseInput(http.adminStatusBodySchema, request.body);
+    return parseOutput(http.publicUserResponseSchema, {
+      user: await repo.setUserBan(user.id, id, body.status === "banned", body.reason ?? "manual review")
+    });
   });
 
   return app;
 }
 
 function readSessionToken(request: FastifyRequest): string | undefined {
-  const cookieToken = request.cookies?.pp_session;
-  const header = request.headers.authorization?.replace(/^Bearer\s+/i, "");
-  const queryToken = (request.query as { session?: string } | undefined)?.session;
-  const rawQueryToken = new URL(request.raw.url ?? "/", "http://localhost").searchParams.get("session") ?? undefined;
-  return cookieToken ?? header ?? queryToken ?? rawQueryToken;
+  return request.cookies?.pp_session;
 }
 
 async function currentUser(repo: AppRepository, request: FastifyRequest): Promise<SessionUser | null> {
   return repo.getSessionUser(readSessionToken(request));
 }
 
-function unauthorized(reply: FastifyReply) {
-  return reply.code(401).send({ message: "로그인이 필요합니다." });
-}
-
-function suspended(reply: FastifyReply) {
-  return reply.code(403).send({ message: "정지된 계정은 이 작업을 수행할 수 없습니다." });
+async function requireAdmin(repo: AppRepository, request: FastifyRequest): Promise<SessionUser> {
+  const user = await currentUser(repo, request);
+  if (!user) unauthorized();
+  if (user.role !== "admin") forbidden();
+  return user;
 }
 
 function isActive(user: SessionUser): boolean {
   return user.status === "active";
+}
+
+function readAppMode(input = process.env): AppMode {
+  if (input.APP_MODE === "demo") return "demo";
+  if (input.NODE_ENV === "production") return "production";
+  if (input.NODE_ENV === "test") return "test";
+  return "development";
+}
+
+function useSecureCookies(mode: AppMode): boolean {
+  return mode === "production" || mode === "demo";
 }
