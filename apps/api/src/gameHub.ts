@@ -3,12 +3,6 @@ import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import type { AppRepository } from "@pong-pong/db";
 import {
-  BALL_RADIUS,
-  GAME_HEIGHT,
-  GAME_WIDTH,
-  PADDLE_HEIGHT,
-  TICK_RATE,
-  WINNING_SCORE,
   encodeServerEvent,
   parseClientEvent,
   type GameFinished,
@@ -19,6 +13,8 @@ import {
   type ServerEvent,
   type SessionUser
 } from "@pong-pong/shared";
+import { PongAi } from "./game/pongAi";
+import { PongSimulation, type PongSimulationState } from "./game/pongSimulation";
 
 type Client = {
   id: string;
@@ -43,21 +39,12 @@ type Room = {
   mode: MatchMode;
   tournamentMatchId: string | null;
   npcUser: PublicUser | null;
-  aiTargetY: number;
+  simulation: PongSimulationState;
+  aiController: PongAi | null;
 };
 
-const INITIAL_BALL_VELOCITY = { x: 10, y: 5 };
-const BALL_ACCELERATION_PER_TICK = 0.015;
-const MAX_BALL_SPEED = 18;
 const NPC_QUEUE_FALLBACK_MS = 6000;
-
-type AiProfile = {
-  reactionTicks: number;
-  predictionNoise: number;
-  mistakeChance: number;
-  paddleSpeedMultiplier: number;
-  deadZone: number;
-};
+const SIMULATION_TIMESTEP_MS = 50;
 
 export class GameHub {
   private readonly clients = new Map<string, Client>();
@@ -275,6 +262,7 @@ export class GameHub {
     const roomId = randomUUID();
     const npcUser = options.npc ?? null;
     const rightPlayer = right?.user ?? npcUser;
+    const simulation = PongSimulation.initialState();
     const room: Room = {
       id: roomId,
       clients: { left, ...(right ? { right } : {}) },
@@ -284,7 +272,8 @@ export class GameHub {
       mode: options.mode,
       tournamentMatchId: options.tournamentMatchId ?? null,
       npcUser,
-      aiTargetY: GAME_HEIGHT / 2,
+      simulation,
+      aiController: options.ai ? new PongAi(roomId, npcUser?.rating ?? 1200) : null,
       snapshot: {
         roomId,
         phase: "waiting",
@@ -292,12 +281,12 @@ export class GameHub {
         leftScore: 0,
         rightScore: 0,
         paddles: {
-          left: { y: GAME_HEIGHT / 2 - PADDLE_HEIGHT / 2, dy: 0 },
-          right: { y: GAME_HEIGHT / 2 - PADDLE_HEIGHT / 2, dy: 0 }
+          left: { y: simulation.paddles.left.y, dy: simulation.paddles.left.direction },
+          right: { y: simulation.paddles.right.y, dy: simulation.paddles.right.direction }
         },
         ball: {
-          position: { x: GAME_WIDTH / 2, y: GAME_HEIGHT / 2 },
-          velocity: { x: INITIAL_BALL_VELOCITY.x, y: INITIAL_BALL_VELOCITY.y }
+          position: { ...simulation.ball.position },
+          velocity: { ...simulation.ball.velocity }
         },
         players: [
           { id: left.user.id, handle: left.user.handle, displayName: left.user.displayName, side: "left", ready: false, ai: false },
@@ -335,7 +324,7 @@ export class GameHub {
     if (room.ai) room.ready.right = true;
     if (room.ready.left && room.ready.right && !room.timer) {
       room.snapshot.phase = "playing";
-      room.timer = setInterval(() => this.tick(room).catch(() => undefined), 1000 / TICK_RATE);
+      room.timer = setInterval(() => this.tick(room).catch(() => undefined), SIMULATION_TIMESTEP_MS);
     }
     this.broadcastRoom(roomId, { type: "game.snapshot", snapshot: room.snapshot });
   }
@@ -363,46 +352,25 @@ export class GameHub {
     room.snapshot.phase = "playing";
     room.snapshot.serverTime = new Date().toISOString();
     if (!room.timer) {
-      room.timer = setInterval(() => this.tick(room).catch(() => undefined), 1000 / TICK_RATE);
+      room.timer = setInterval(() => this.tick(room).catch(() => undefined), SIMULATION_TIMESTEP_MS);
     }
     this.broadcastRoom(roomId, { type: "game.snapshot", snapshot: room.snapshot });
   }
 
   private async tick(room: Room): Promise<void> {
-    const state = room.snapshot;
-    if (state.phase !== "playing") return;
-    state.tick += 1;
-    state.serverTime = new Date().toISOString();
+    if (room.snapshot.phase !== "playing") return;
+    const rightDirection = room.aiController
+      ? room.aiController.nextDirection(room.simulation)
+      : room.snapshot.paddles.right.dy;
+    room.simulation = PongSimulation.step(room.simulation, {
+      left: room.snapshot.paddles.left.dy,
+      right: rightDirection
+    }, SIMULATION_TIMESTEP_MS);
+    syncSnapshot(room);
+    this.broadcastRoom(room.id, { type: "game.snapshot", snapshot: room.snapshot });
 
-    const speed = 13;
-    state.paddles.left.y = clamp(state.paddles.left.y + state.paddles.left.dy * speed, 16, GAME_HEIGHT - PADDLE_HEIGHT - 16);
-    if (room.ai) {
-      updateAiPaddleIntent(room);
-    }
-    const rightSpeed = room.ai ? speed * aiProfileFor(room.npcUser?.rating ?? 1200).paddleSpeedMultiplier : speed;
-    state.paddles.right.y = clamp(state.paddles.right.y + state.paddles.right.dy * rightSpeed, 16, GAME_HEIGHT - PADDLE_HEIGHT - 16);
-
-    state.ball.position.x += state.ball.velocity.x;
-    state.ball.position.y += state.ball.velocity.y;
-    if (state.ball.position.y < BALL_RADIUS || state.ball.position.y > GAME_HEIGHT - BALL_RADIUS) {
-      state.ball.velocity.y *= -1;
-    }
-    collidePaddle(state, "left", 32);
-    collidePaddle(state, "right", GAME_WIDTH - 32);
-
-    if (state.ball.position.x < 0) {
-      state.rightScore += 1;
-      resetBall(state, -1);
-    }
-    if (state.ball.position.x > GAME_WIDTH) {
-      state.leftScore += 1;
-      resetBall(state, 1);
-    }
-    accelerateBall(state);
-    this.broadcastRoom(room.id, { type: "game.snapshot", snapshot: state });
-
-    if (state.leftScore >= WINNING_SCORE || state.rightScore >= WINNING_SCORE || state.tick >= TICK_RATE * 45) {
-      await this.finishRoom(room, state.leftScore >= state.rightScore ? "left" : "right");
+    if (room.simulation.phase === "finished" && room.simulation.winnerSide) {
+      await this.finishRoom(room, room.simulation.winnerSide);
     }
   }
 
@@ -487,96 +455,22 @@ function clearQueueTimer(entry: QueueEntry): void {
   }
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-function updateAiPaddleIntent(room: Room): void {
-  const state = room.snapshot;
-  const profile = aiProfileFor(room.npcUser?.rating ?? 1200);
-  if (state.tick % profile.reactionTicks === 0) {
-    const targetBase = state.ball.velocity.x > 0 ? predictedBallY(state) : GAME_HEIGHT / 2;
-    const noise = signedDeterministic(room.id, state.tick, 1) * profile.predictionNoise;
-    const mistake = deterministicUnit(room.id, state.tick, 2) < profile.mistakeChance;
-    const mistakeOffset = mistake ? signedDeterministic(room.id, state.tick, 3) * 110 : 0;
-    room.aiTargetY = clamp(targetBase + noise + mistakeOffset, 16 + PADDLE_HEIGHT / 2, GAME_HEIGHT - 16 - PADDLE_HEIGHT / 2);
-  }
-  const center = state.paddles.right.y + PADDLE_HEIGHT / 2;
-  state.paddles.right.dy = room.aiTargetY > center + profile.deadZone ? 1 : room.aiTargetY < center - profile.deadZone ? -1 : 0;
-}
-
-function aiProfileFor(rating: number): AiProfile {
-  if (rating >= 1400) {
-    return { reactionTicks: 3, predictionNoise: 20, mistakeChance: 0.04, paddleSpeedMultiplier: 1.05, deadZone: 10 };
-  }
-  if (rating >= 1300) {
-    return { reactionTicks: 4, predictionNoise: 34, mistakeChance: 0.08, paddleSpeedMultiplier: 0.96, deadZone: 14 };
-  }
-  if (rating >= 1200) {
-    return { reactionTicks: 6, predictionNoise: 54, mistakeChance: 0.12, paddleSpeedMultiplier: 0.86, deadZone: 18 };
-  }
-  return { reactionTicks: 8, predictionNoise: 78, mistakeChance: 0.18, paddleSpeedMultiplier: 0.74, deadZone: 24 };
-}
-
-function predictedBallY(state: GameSnapshot): number {
-  if (state.ball.velocity.x <= 0) return state.ball.position.y;
-  const distance = GAME_WIDTH - 32 - state.ball.position.x;
-  const ticks = distance / Math.max(1, state.ball.velocity.x);
-  let y = state.ball.position.y + state.ball.velocity.y * ticks;
-  const min = BALL_RADIUS;
-  const max = GAME_HEIGHT - BALL_RADIUS;
-  while (y < min || y > max) {
-    if (y < min) y = min + (min - y);
-    if (y > max) y = max - (y - max);
-  }
-  return y;
-}
-
-function deterministicUnit(seed: string, tick: number, salt: number): number {
-  const value = Math.sin(hashString(seed) * 0.001 + tick * 12.9898 + salt * 78.233) * 43758.5453;
-  return value - Math.floor(value);
-}
-
-function signedDeterministic(seed: string, tick: number, salt: number): number {
-  return deterministicUnit(seed, tick, salt) * 2 - 1;
-}
-
-function hashString(value: string): number {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
-  }
-  return hash;
-}
-
-function resetBall(state: GameSnapshot, xDirection: 1 | -1): void {
-  state.ball.position = { x: GAME_WIDTH / 2, y: GAME_HEIGHT / 2 };
-  const elapsedBoost = Math.min(1.35, 1 + state.tick / (TICK_RATE * 90));
-  state.ball.velocity = {
-    x: INITIAL_BALL_VELOCITY.x * elapsedBoost * xDirection,
-    y: INITIAL_BALL_VELOCITY.y * elapsedBoost * (state.tick % 2 === 0 ? 1 : -1)
+function syncSnapshot(room: Room): void {
+  const state = room.simulation;
+  room.snapshot.tick = state.tick;
+  room.snapshot.leftScore = state.leftScore;
+  room.snapshot.rightScore = state.rightScore;
+  room.snapshot.paddles.left = {
+    y: state.paddles.left.y,
+    dy: state.paddles.left.direction
   };
-}
-
-function collidePaddle(state: GameSnapshot, side: PlayerSide, x: number): void {
-  const paddle = state.paddles[side];
-  const ball = state.ball;
-  const withinY = ball.position.y >= paddle.y && ball.position.y <= paddle.y + PADDLE_HEIGHT;
-  const withinX = side === "left" ? ball.position.x - BALL_RADIUS <= x + 18 : ball.position.x + BALL_RADIUS >= x - 18;
-  if (withinX && withinY && Math.sign(ball.velocity.x) === (side === "left" ? -1 : 1)) {
-    ball.velocity.x *= -1.04;
-    const offset = (ball.position.y - (paddle.y + PADDLE_HEIGHT / 2)) / (PADDLE_HEIGHT / 2);
-    ball.velocity.y = offset * 7;
-  }
-}
-
-function accelerateBall(state: GameSnapshot): void {
-  const velocity = state.ball.velocity;
-  const currentSpeed = Math.hypot(velocity.x, velocity.y);
-  if (currentSpeed <= 0 || currentSpeed >= MAX_BALL_SPEED) return;
-  const elapsedMinimum = Math.min(MAX_BALL_SPEED, Math.hypot(INITIAL_BALL_VELOCITY.x, INITIAL_BALL_VELOCITY.y) + state.tick * BALL_ACCELERATION_PER_TICK);
-  const nextSpeed = Math.min(MAX_BALL_SPEED, Math.max(currentSpeed + BALL_ACCELERATION_PER_TICK, elapsedMinimum));
-  const scale = nextSpeed / currentSpeed;
-  velocity.x *= scale;
-  velocity.y *= scale;
+  room.snapshot.paddles.right = {
+    y: state.paddles.right.y,
+    dy: state.paddles.right.direction
+  };
+  room.snapshot.ball = {
+    position: { ...state.ball.position },
+    velocity: { ...state.ball.velocity }
+  };
+  room.snapshot.serverTime = new Date().toISOString();
 }
