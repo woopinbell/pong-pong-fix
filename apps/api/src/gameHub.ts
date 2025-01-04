@@ -21,7 +21,14 @@ type Client = {
   socket: WebSocket;
   user: SessionUser;
   roomId: string | null;
+  lastInputSequenceByRoom: Map<string, number>;
 };
+
+type VersionlessServerEvent = ServerEvent extends infer Event
+  ? Event extends { v: 1 }
+    ? Omit<Event, "v">
+    : never
+  : never;
 
 type QueueEntry = {
   client: Client;
@@ -56,7 +63,13 @@ export class GameHub {
   constructor(private readonly repo: AppRepository) {}
 
   connect(socket: WebSocket, request: IncomingMessage, user: SessionUser, pendingPayloads: string[] = []): void {
-    const client: Client = { id: randomUUID(), socket, user, roomId: null };
+    const client: Client = {
+      id: randomUUID(),
+      socket,
+      user,
+      roomId: null,
+      lastInputSequenceByRoom: new Map()
+    };
     this.clients.set(client.id, client);
     socket.on("message", (payload) => this.receive(client, payload.toString()));
     socket.on("close", () => this.disconnect(client));
@@ -75,7 +88,7 @@ export class GameHub {
       if (event.type === "game.ready") this.markReady(client, event.roomId);
       if (event.type === "game.pause") this.pauseRoom(client, event.roomId);
       if (event.type === "game.resume") this.resumeRoom(client, event.roomId);
-      if (event.type === "game.input") this.applyInput(client, event.roomId, event.direction);
+      if (event.type === "game.input") this.applyInput(client, event.roomId, event.inputSeq, event.direction);
       if (event.type === "chat.send") {
         const message = await this.repo.createChatMessage({
           scope: event.scope,
@@ -90,7 +103,11 @@ export class GameHub {
         }
       }
     } catch (error) {
-      this.send(client, { type: "error", message: error instanceof Error ? error.message : "메시지를 처리하지 못했습니다." });
+      this.send(client, {
+        type: "error",
+        code: "invalid_event",
+        message: error instanceof Error ? error.message : "메시지를 처리하지 못했습니다."
+      });
     }
   }
 
@@ -119,7 +136,11 @@ export class GameHub {
       const entry: QueueEntry = { client, queuedAt: Date.now(), npcFallbackTimer: null };
       entry.npcFallbackTimer = setTimeout(() => {
         this.matchQueuedClientWithNpc(entry).catch((error) => {
-          this.send(client, { type: "error", message: error instanceof Error ? error.message : "AI 상대를 찾지 못했습니다." });
+          this.send(client, {
+            type: "error",
+            code: "internal_error",
+            message: error instanceof Error ? error.message : "AI 상대를 찾지 못했습니다."
+          });
         });
       }, NPC_QUEUE_FALLBACK_MS);
       this.queue.push(entry);
@@ -162,15 +183,15 @@ export class GameHub {
     this.leaveTournamentWaiters(client);
     const match = await this.repo.getTournamentMatch(matchId);
     if (!match || match.status !== "ready") {
-      this.send(client, { type: "error", message: "참가할 수 없는 토너먼트 경기입니다." });
+      this.send(client, { type: "error", code: "not_found", message: "참가할 수 없는 토너먼트 경기입니다." });
       return;
     }
     if (match.leftUserId !== client.user.id && match.rightUserId !== client.user.id) {
-      this.send(client, { type: "error", message: "토너먼트 경기 참가자가 아닙니다." });
+      this.send(client, { type: "error", code: "forbidden", message: "토너먼트 경기 참가자가 아닙니다." });
       return;
     }
     if (client.roomId) {
-      this.send(client, { type: "error", message: "이미 진행 중인 경기가 있습니다." });
+      this.send(client, { type: "error", code: "forbidden", message: "이미 진행 중인 경기가 있습니다." });
       return;
     }
     const waiters = this.tournamentWaiters.get(matchId) ?? [];
@@ -276,30 +297,33 @@ export class GameHub {
       aiController: options.ai ? new PongAi(roomId, npcUser?.rating ?? 1200) : null,
       snapshot: {
         roomId,
-        phase: "waiting",
         tick: 0,
-        leftScore: 0,
-        rightScore: 0,
-        paddles: {
-          left: { y: simulation.paddles.left.y, dy: simulation.paddles.left.direction },
-          right: { y: simulation.paddles.right.y, dy: simulation.paddles.right.direction }
-        },
-        ball: {
-          position: { ...simulation.ball.position },
-          velocity: { ...simulation.ball.velocity }
-        },
-        players: [
-          { id: left.user.id, handle: left.user.handle, displayName: left.user.displayName, side: "left", ready: false, ai: false },
-          {
-            id: rightPlayer?.id ?? "ai-opponent",
-            handle: rightPlayer?.handle ?? "ai",
-            displayName: rightPlayer?.displayName ?? "연습 AI",
-            side: "right",
-            ready: options.ai,
-            ai: options.ai
-          }
-        ],
-        serverTime: new Date().toISOString()
+        sequence: 0,
+        serverTimeMs: Date.now(),
+        state: {
+          phase: "waiting",
+          leftScore: 0,
+          rightScore: 0,
+          paddles: {
+            left: { y: simulation.paddles.left.y, dy: simulation.paddles.left.direction },
+            right: { y: simulation.paddles.right.y, dy: simulation.paddles.right.direction }
+          },
+          ball: {
+            position: { ...simulation.ball.position },
+            velocity: { ...simulation.ball.velocity }
+          },
+          players: [
+            { id: left.user.id, handle: left.user.handle, displayName: left.user.displayName, side: "left", ready: false, ai: false },
+            {
+              id: rightPlayer?.id ?? "ai-opponent",
+              handle: rightPlayer?.handle ?? "ai",
+              displayName: rightPlayer?.displayName ?? "연습 AI",
+              side: "right",
+              ready: options.ai,
+              ai: options.ai
+            }
+          ]
+        }
       }
     };
     this.rooms.set(roomId, room);
@@ -307,7 +331,7 @@ export class GameHub {
     if (right) right.roomId = roomId;
     this.send(left, { type: "queue.matched", roomId, side: "left", opponent: rightPlayer?.displayName ?? "연습 AI" });
     if (right) this.send(right, { type: "queue.matched", roomId, side: "right", opponent: left.user.displayName });
-    this.broadcastRoom(roomId, { type: "game.snapshot", snapshot: room.snapshot });
+    this.broadcastSnapshot(room);
     this.broadcastPresence();
     return roomId;
   }
@@ -318,56 +342,58 @@ export class GameHub {
     const side = sideFor(room, client);
     if (!side) return;
     room.ready[side] = true;
-    for (const player of room.snapshot.players) {
+    for (const player of room.snapshot.state.players) {
       if (player.side === side) player.ready = true;
     }
     if (room.ai) room.ready.right = true;
     if (room.ready.left && room.ready.right && !room.timer) {
-      room.snapshot.phase = "playing";
+      room.snapshot.state.phase = "playing";
       room.timer = setInterval(() => this.tick(room).catch(() => undefined), SIMULATION_TIMESTEP_MS);
     }
-    this.broadcastRoom(roomId, { type: "game.snapshot", snapshot: room.snapshot });
+    this.broadcastSnapshot(room);
   }
 
-  private applyInput(client: Client, roomId: string, direction: -1 | 0 | 1): void {
+  private applyInput(client: Client, roomId: string, inputSeq: number, direction: -1 | 0 | 1): void {
     const room = this.rooms.get(roomId);
-    if (!room || room.snapshot.phase !== "playing") return;
+    if (!room || room.snapshot.state.phase !== "playing") return;
     const side = sideFor(room, client);
-    if (side) room.snapshot.paddles[side].dy = direction;
+    if (!side) return;
+    const previousSequence = client.lastInputSequenceByRoom.get(roomId) ?? -1;
+    if (inputSeq <= previousSequence) return;
+    client.lastInputSequenceByRoom.set(roomId, inputSeq);
+    room.snapshot.state.paddles[side].dy = direction;
   }
 
   private pauseRoom(client: Client, roomId: string): void {
     const room = this.rooms.get(roomId);
-    if (!room || room.snapshot.phase !== "playing" || !sideFor(room, client)) return;
+    if (!room || room.snapshot.state.phase !== "playing" || !sideFor(room, client)) return;
     if (room.timer) clearInterval(room.timer);
     room.timer = null;
-    room.snapshot.phase = "paused";
-    room.snapshot.serverTime = new Date().toISOString();
-    this.broadcastRoom(roomId, { type: "game.snapshot", snapshot: room.snapshot });
+    room.snapshot.state.phase = "paused";
+    this.broadcastSnapshot(room);
   }
 
   private resumeRoom(client: Client, roomId: string): void {
     const room = this.rooms.get(roomId);
-    if (!room || room.snapshot.phase !== "paused" || !sideFor(room, client)) return;
-    room.snapshot.phase = "playing";
-    room.snapshot.serverTime = new Date().toISOString();
+    if (!room || room.snapshot.state.phase !== "paused" || !sideFor(room, client)) return;
+    room.snapshot.state.phase = "playing";
     if (!room.timer) {
       room.timer = setInterval(() => this.tick(room).catch(() => undefined), SIMULATION_TIMESTEP_MS);
     }
-    this.broadcastRoom(roomId, { type: "game.snapshot", snapshot: room.snapshot });
+    this.broadcastSnapshot(room);
   }
 
   private async tick(room: Room): Promise<void> {
-    if (room.snapshot.phase !== "playing") return;
+    if (room.snapshot.state.phase !== "playing") return;
     const rightDirection = room.aiController
       ? room.aiController.nextDirection(room.simulation)
-      : room.snapshot.paddles.right.dy;
+      : room.snapshot.state.paddles.right.dy;
     room.simulation = PongSimulation.step(room.simulation, {
-      left: room.snapshot.paddles.left.dy,
+      left: room.snapshot.state.paddles.left.dy,
       right: rightDirection
     }, SIMULATION_TIMESTEP_MS);
     syncSnapshot(room);
-    this.broadcastRoom(room.id, { type: "game.snapshot", snapshot: room.snapshot });
+    this.broadcastSnapshot(room);
 
     if (room.simulation.phase === "finished" && room.simulation.winnerSide) {
       await this.finishRoom(room, room.simulation.winnerSide);
@@ -377,7 +403,7 @@ export class GameHub {
   private async finishRoom(room: Room, winnerSide: PlayerSide): Promise<void> {
     if (room.timer) clearInterval(room.timer);
     room.timer = null;
-    room.snapshot.phase = "finished";
+    room.snapshot.state.phase = "finished";
     const leftUser = room.clients.left?.user ?? null;
     const rightUser = room.clients.right?.user ?? room.npcUser ?? null;
     const winner = winnerSide === "left" ? leftUser : rightUser;
@@ -386,15 +412,16 @@ export class GameHub {
       mode: room.mode,
       winnerId: winner?.id ?? null,
       loserId: loser?.id ?? null,
-      scoreLeft: room.snapshot.leftScore,
-      scoreRight: room.snapshot.rightScore
+      scoreLeft: room.snapshot.state.leftScore,
+      scoreRight: room.snapshot.state.rightScore
     });
     const result: GameFinished = {
       roomId: room.id,
       matchId,
+      persisted: true,
       winnerSide,
-      leftScore: room.snapshot.leftScore,
-      rightScore: room.snapshot.rightScore,
+      leftScore: room.snapshot.state.leftScore,
+      rightScore: room.snapshot.state.rightScore,
       ratingDelta: 16
     };
     this.broadcastRoom(room.id, { type: "game.finished", result });
@@ -404,8 +431,8 @@ export class GameHub {
         roomId: room.id,
         matchId,
         winnerId: winner?.id ?? null,
-        scoreLeft: room.snapshot.leftScore,
-        scoreRight: room.snapshot.rightScore
+        scoreLeft: room.snapshot.state.leftScore,
+        scoreRight: room.snapshot.state.rightScore
       });
     }
     for (const client of Object.values(room.clients)) {
@@ -423,11 +450,11 @@ export class GameHub {
     });
   }
 
-  private broadcastAll(event: ServerEvent): void {
+  private broadcastAll(event: VersionlessServerEvent): void {
     for (const client of this.clients.values()) this.send(client, event);
   }
 
-  private broadcastRoom(roomId: string, event: ServerEvent): void {
+  private broadcastRoom(roomId: string, event: VersionlessServerEvent): void {
     const room = this.rooms.get(roomId);
     if (!room) return;
     for (const client of Object.values(room.clients)) {
@@ -435,9 +462,15 @@ export class GameHub {
     }
   }
 
-  private send(client: Client, event: ServerEvent): void {
+  private broadcastSnapshot(room: Room): void {
+    room.snapshot.sequence += 1;
+    room.snapshot.serverTimeMs = Date.now();
+    this.broadcastRoom(room.id, { type: "game.snapshot", snapshot: room.snapshot });
+  }
+
+  private send(client: Client, event: VersionlessServerEvent): void {
     if (client.socket.readyState === WebSocket.OPEN) {
-      client.socket.send(encodeServerEvent(event));
+      client.socket.send(encodeServerEvent({ ...event, v: 1 } as ServerEvent));
     }
   }
 }
@@ -458,19 +491,18 @@ function clearQueueTimer(entry: QueueEntry): void {
 function syncSnapshot(room: Room): void {
   const state = room.simulation;
   room.snapshot.tick = state.tick;
-  room.snapshot.leftScore = state.leftScore;
-  room.snapshot.rightScore = state.rightScore;
-  room.snapshot.paddles.left = {
+  room.snapshot.state.leftScore = state.leftScore;
+  room.snapshot.state.rightScore = state.rightScore;
+  room.snapshot.state.paddles.left = {
     y: state.paddles.left.y,
     dy: state.paddles.left.direction
   };
-  room.snapshot.paddles.right = {
+  room.snapshot.state.paddles.right = {
     y: state.paddles.right.y,
     dy: state.paddles.right.direction
   };
-  room.snapshot.ball = {
+  room.snapshot.state.ball = {
     position: { ...state.ball.position },
     velocity: { ...state.ball.velocity }
   };
-  room.snapshot.serverTime = new Date().toISOString();
 }

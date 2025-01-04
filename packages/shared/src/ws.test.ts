@@ -5,6 +5,7 @@ import {
   parseServerEvent,
   type ServerEvent
 } from "./ws";
+import type { GameSnapshot } from "./game";
 
 describe("version 1 client events", () => {
   it.each([
@@ -59,7 +60,7 @@ describe("version 1 client events", () => {
 });
 
 describe("version 1 server events", () => {
-  const snapshot = {
+  const snapshot: GameSnapshot = {
     roomId: "room-1",
     tick: 12,
     sequence: 15,
@@ -81,7 +82,7 @@ describe("version 1 server events", () => {
         { id: "player-2", handle: "right-player", displayName: "Right Player", side: "right", ready: true, ai: false }
       ]
     }
-  } as const;
+  };
 
   const events = [
     { v: 1, type: "queue.matched", roomId: "room-1", side: "left", opponent: "Opponent" },
