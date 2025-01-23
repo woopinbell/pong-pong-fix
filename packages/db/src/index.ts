@@ -31,6 +31,13 @@ type RawUser = {
   is_npc: boolean;
 };
 
+type MemoryFriendship = {
+  id: string;
+  requesterId: string;
+  addresseeId: string;
+  status: FriendSummary["status"];
+};
+
 export interface DevLoginInput {
   handle: string;
   displayName: string;
@@ -366,21 +373,45 @@ class PostgresRepository implements AppRepository {
   async requestFriend(requesterId: string, addresseeHandle: string): Promise<FriendSummary> {
     const addressee = await this.getUserByHandle(addresseeHandle);
     if (!addressee) throw new Error("friend not found");
-    const result = await sql<any>`
+    if (requesterId === addressee.id) throw new Error("cannot friend yourself");
+    const result = await sql<{ id: string; status: FriendSummary["status"] }>`
       insert into friendships (requester_id, addressee_id, status)
       values (${requesterId}, ${addressee.id}, 'pending')
-      on conflict (requester_id, addressee_id) do update set updated_at = now()
+      on conflict (
+        (least(requester_id, addressee_id)),
+        (greatest(requester_id, addressee_id))
+      ) do update set
+        status = case
+          when friendships.status = 'pending'
+            and friendships.requester_id = excluded.addressee_id
+            and friendships.addressee_id = excluded.requester_id
+          then 'accepted'
+          else friendships.status
+        end,
+        updated_at = case
+          when friendships.status = 'pending'
+            and friendships.requester_id = excluded.addressee_id
+            and friendships.addressee_id = excluded.requester_id
+          then now()
+          else friendships.updated_at
+        end
       returning id, status
     `.execute(this.db);
-    return { id: firstRow(result).id, status: firstRow(result).status, user: addressee };
+    const friendship = firstRow(result);
+    return { id: friendship.id, status: friendship.status, user: addressee };
   }
 
   async acceptFriend(userId: string, friendshipId: string): Promise<FriendSummary> {
-    await sql`update friendships set status = 'accepted', updated_at = now() where id = ${friendshipId} and addressee_id = ${userId}`.execute(this.db);
-    const friends = await this.listFriends(userId);
-    const found = friends.find((friend) => friend.id === friendshipId);
-    if (!found) throw new Error("friendship not found");
-    return found;
+    const result = await sql<{ id: string; status: FriendSummary["status"]; requester_id: string }>`
+      update friendships
+      set status = 'accepted', updated_at = now()
+      where id = ${friendshipId} and addressee_id = ${userId}
+      returning id, status, requester_id
+    `.execute(this.db);
+    const friendship = firstRow(result);
+    const requester = await this.getUserById(friendship.requester_id);
+    if (!requester) throw new Error("friend not found");
+    return { id: friendship.id, status: friendship.status, user: requester };
   }
 
   async createMatch(input: CreateMatchInput): Promise<string> {
@@ -663,29 +694,48 @@ class PostgresRepository implements AppRepository {
   }
 
   async joinTournament(tournamentId: string, userId: string): Promise<TournamentSummary> {
-    const count = await sql<{ count: string }>`select count(*)::text from tournament_entries where tournament_id = ${tournamentId}`.execute(this.db);
-    const tournament = await sql<{ capacity: number; joined: boolean }>`
-      select capacity, exists(select 1 from tournament_entries where tournament_id = ${tournamentId} and user_id = ${userId}) as joined
-      from tournaments
-      where id = ${tournamentId}
-      limit 1
-    `.execute(this.db);
-    const tournamentRow = firstRow(tournament);
-    if (!tournamentRow.joined && Number(firstRow(count).count) >= Number(tournamentRow.capacity)) {
-      throw new Error("tournament full");
-    }
-    const seed = Number(firstRow(count).count) + 1;
-    await sql`
-      insert into tournament_entries (tournament_id, user_id, seed)
-      values (${tournamentId}, ${userId}, ${seed})
-      on conflict (tournament_id, user_id) do nothing
-    `.execute(this.db);
-    await sql`
-      update tournaments
-      set status = case when (select count(*) from tournament_entries where tournament_id = ${tournamentId}) >= capacity then 'running' else status end
-      where id = ${tournamentId}
-    `.execute(this.db);
-    await this.ensureTournamentBracket(tournamentId);
+    await this.db.transaction().execute(async (transaction) => {
+      const tournament = await sql<{ capacity: number }>`
+        select capacity
+        from tournaments
+        where id = ${tournamentId}
+        for update
+      `.execute(transaction);
+      const tournamentRow = firstRow(tournament);
+      const existing = await sql<{ id: string }>`
+        select id
+        from tournament_entries
+        where tournament_id = ${tournamentId} and user_id = ${userId}
+        limit 1
+      `.execute(transaction);
+      if (existing.rows[0]) return;
+
+      const entryState = await sql<{ count: number; next_seed: number }>`
+        select
+          count(*)::integer as count,
+          (coalesce(max(seed), 0) + 1)::integer as next_seed
+        from tournament_entries
+        where tournament_id = ${tournamentId}
+      `.execute(transaction);
+      const state = firstRow(entryState);
+      if (Number(state.count) >= Number(tournamentRow.capacity)) {
+        throw new Error("tournament full");
+      }
+
+      await sql`
+        insert into tournament_entries (tournament_id, user_id, seed)
+        values (${tournamentId}, ${userId}, ${state.next_seed})
+      `.execute(transaction);
+      const playerCount = Number(state.count) + 1;
+      if (playerCount >= Number(tournamentRow.capacity)) {
+        await sql`
+          update tournaments
+          set status = 'running'
+          where id = ${tournamentId}
+        `.execute(transaction);
+        await this.ensureTournamentBracket(tournamentId, transaction);
+      }
+    });
     const tournaments = await this.listTournaments();
     const found = tournaments.find((item) => item.id === tournamentId);
     if (!found) throw new Error("tournament not found");
@@ -805,13 +855,13 @@ class PostgresRepository implements AppRepository {
     };
   }
 
-  private async ensureTournamentBracket(tournamentId: string): Promise<void> {
+  private async ensureTournamentBracket(tournamentId: string, executor: Kysely<any> = this.db): Promise<void> {
     const entries = await sql<{ user_id: string; seed: number }>`
       select user_id, seed
       from tournament_entries
       where tournament_id = ${tournamentId}
       order by seed asc
-    `.execute(this.db);
+    `.execute(executor);
     if (entries.rows.length < 4) return;
     await sql`
       insert into tournament_matches (tournament_id, round, slot, left_user_id, right_user_id, status)
@@ -819,7 +869,7 @@ class PostgresRepository implements AppRepository {
         (${tournamentId}, 'semifinal', 1, ${entries.rows[0].user_id}, ${entries.rows[3].user_id}, 'ready'),
         (${tournamentId}, 'semifinal', 2, ${entries.rows[1].user_id}, ${entries.rows[2].user_id}, 'ready')
       on conflict (tournament_id, round, slot) do nothing
-    `.execute(this.db);
+    `.execute(executor);
   }
 
   private async ensureFinalMatch(tournamentId: string): Promise<void> {
@@ -861,7 +911,7 @@ class MemoryRepository implements AppRepository {
   private readonly wsTickets = new Map<string, { userId: string; expiresAt: number }>();
   private readonly matches: Array<any> = [];
   private readonly chats: ChatMessage[] = [];
-  private readonly friendships: FriendSummary[] = [];
+  private readonly friendships: MemoryFriendship[] = [];
   private readonly tournaments: TournamentSummary[] = [];
   private readonly adminActions: AdminActionSummary[] = [];
 
@@ -1028,23 +1078,55 @@ class MemoryRepository implements AppRepository {
     };
   }
 
-  async listFriends(): Promise<FriendSummary[]> {
-    return this.friendships;
+  async listFriends(userId: string): Promise<FriendSummary[]> {
+    return this.friendships
+      .filter((friendship) => friendship.requesterId === userId || friendship.addresseeId === userId)
+      .map((friendship) => {
+        const otherUserId = friendship.requesterId === userId
+          ? friendship.addresseeId
+          : friendship.requesterId;
+        const otherUser = this.users.get(otherUserId);
+        if (!otherUser) throw new Error("friend not found");
+        return {
+          id: friendship.id,
+          status: friendship.status,
+          user: toPublicUser(otherUser, true)
+        };
+      });
   }
 
   async requestFriend(requesterId: string, addresseeHandle: string): Promise<FriendSummary> {
     const user = await this.getUserByHandle(addresseeHandle);
     if (!user) throw new Error("friend not found");
-    const friend = { id: randomUUID(), user, status: "pending" as const };
-    this.friendships.push(friend);
-    return friend;
+    if (requesterId === user.id) throw new Error("cannot friend yourself");
+    const existing = this.friendships.find((friendship) =>
+      (friendship.requesterId === requesterId && friendship.addresseeId === user.id)
+      || (friendship.requesterId === user.id && friendship.addresseeId === requesterId)
+    );
+    if (existing) {
+      const isReversePending = existing.status === "pending"
+        && existing.requesterId === user.id
+        && existing.addresseeId === requesterId;
+      if (isReversePending) existing.status = "accepted";
+      return { id: existing.id, status: existing.status, user };
+    }
+    const friendship: MemoryFriendship = {
+      id: randomUUID(),
+      requesterId,
+      addresseeId: user.id,
+      status: "pending"
+    };
+    this.friendships.push(friendship);
+    return { id: friendship.id, status: friendship.status, user };
   }
 
-  async acceptFriend(_userId: string, friendshipId: string): Promise<FriendSummary> {
+  async acceptFriend(userId: string, friendshipId: string): Promise<FriendSummary> {
     const friend = this.friendships.find((item) => item.id === friendshipId);
-    if (!friend) throw new Error("friendship not found");
+    if (!friend || friend.addresseeId !== userId) throw new Error("friendship not found");
     friend.status = "accepted";
-    return friend;
+    const requester = this.users.get(friend.requesterId);
+    if (!requester) throw new Error("friend not found");
+    return { id: friend.id, status: friend.status, user: toPublicUser(requester, true) };
   }
 
   async createMatch(input: CreateMatchInput): Promise<string> {
@@ -1175,8 +1257,9 @@ class MemoryRepository implements AppRepository {
 
   async joinTournament(tournamentId: string, userId: string): Promise<TournamentSummary> {
     const tournament = this.tournaments.find((item) => item.id === tournamentId);
-    const user = await this.getUserById(userId);
-    if (!tournament || !user) throw new Error("tournament not found");
+    const rawUser = this.users.get(userId);
+    if (!tournament || !rawUser) throw new Error("tournament not found");
+    const user = toPublicUser(rawUser, true);
     const alreadyJoined = tournament.entries.some((entry) => entry.id === user.id);
     if (!alreadyJoined && tournament.entries.length >= tournament.capacity) {
       throw new Error("tournament full");
