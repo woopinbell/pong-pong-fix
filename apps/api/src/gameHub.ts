@@ -13,6 +13,10 @@ import {
   type ServerEvent,
   type SessionUser
 } from "@pong-pong/shared";
+import { DEFAULT_TIMESTEP_MS, FixedStepScheduler } from "./game/fixedStepScheduler";
+import { ConnectionHeartbeat } from "./game/heartbeat";
+import { InputGate } from "./game/inputGate";
+import { HARD_BUFFERED_AMOUNT_BYTES, LatestSnapshotBuffer } from "./game/latestSnapshotBuffer";
 import { PongAi } from "./game/pongAi";
 import { PongSimulation, type PongSimulationState } from "./game/pongSimulation";
 
@@ -21,7 +25,8 @@ type Client = {
   socket: WebSocket;
   user: SessionUser;
   roomId: string | null;
-  lastInputSequenceByRoom: Map<string, number>;
+  heartbeat: ConnectionHeartbeat;
+  snapshots: LatestSnapshotBuffer;
 };
 
 type VersionlessServerEvent = ServerEvent extends infer Event
@@ -42,7 +47,7 @@ type Room = {
   ai: boolean;
   ready: Partial<Record<PlayerSide, boolean>>;
   snapshot: GameSnapshot;
-  timer: NodeJS.Timeout | null;
+  scheduler: FixedStepScheduler | null;
   mode: MatchMode;
   tournamentMatchId: string | null;
   npcUser: PublicUser | null;
@@ -52,7 +57,7 @@ type Room = {
 };
 
 const NPC_QUEUE_FALLBACK_MS = 6000;
-const SIMULATION_TIMESTEP_MS = 50;
+const SIMULATION_TIMESTEP_MS = DEFAULT_TIMESTEP_MS;
 
 export class GameHub {
   private readonly clients = new Map<string, Client>();
@@ -60,20 +65,30 @@ export class GameHub {
   private readonly rooms = new Map<string, Room>();
   private readonly tournamentWaiters = new Map<string, Client[]>();
   private readonly waitSamples: number[] = [];
+  private readonly inputGate = new InputGate();
 
   constructor(private readonly repo: AppRepository) {}
 
-  connect(socket: WebSocket, request: IncomingMessage, user: SessionUser, pendingPayloads: string[] = []): void {
+  connect(socket: WebSocket, _request: IncomingMessage, user: SessionUser, pendingPayloads: string[] = []): void {
+    const heartbeat = new ConnectionHeartbeat({
+      ping: () => {
+        if (socket.readyState === WebSocket.OPEN) socket.ping();
+      },
+      terminate: () => socket.terminate()
+    });
     const client: Client = {
       id: randomUUID(),
       socket,
       user,
       roomId: null,
-      lastInputSequenceByRoom: new Map()
+      heartbeat,
+      snapshots: new LatestSnapshotBuffer(socket)
     };
     this.clients.set(client.id, client);
     socket.on("message", (payload) => this.receive(client, payload.toString()));
+    socket.on("pong", () => heartbeat.acknowledge());
     socket.on("close", () => this.disconnect(client));
+    heartbeat.start();
     this.broadcastPresence();
     for (const payload of pendingPayloads) {
       this.receive(client, payload).catch(() => undefined);
@@ -113,9 +128,15 @@ export class GameHub {
   }
 
   private disconnect(client: Client): void {
+    if (!this.clients.has(client.id)) return;
+    client.heartbeat.stop();
+    client.snapshots.close();
     this.leaveQueue(client);
     this.leaveTournamentWaiters(client);
     this.clients.delete(client.id);
+    if (![...this.clients.values()].some((candidate) => candidate.user.id === client.user.id)) {
+      this.inputGate.releaseUser(client.user.id);
+    }
     if (client.roomId) {
       const room = this.rooms.get(client.roomId);
       if (room) {
@@ -290,7 +311,7 @@ export class GameHub {
       clients: { left, ...(right ? { right } : {}) },
       ai: options.ai,
       ready: {},
-      timer: null,
+      scheduler: null,
       mode: options.mode,
       tournamentMatchId: options.tournamentMatchId ?? null,
       npcUser,
@@ -348,9 +369,9 @@ export class GameHub {
       if (player.side === side) player.ready = true;
     }
     if (room.ai) room.ready.right = true;
-    if (room.ready.left && room.ready.right && !room.timer) {
+    if (room.ready.left && room.ready.right && room.snapshot.state.phase === "waiting") {
       room.snapshot.state.phase = "playing";
-      room.timer = setInterval(() => this.tick(room).catch(() => undefined), SIMULATION_TIMESTEP_MS);
+      this.startRoomScheduler(room);
     }
     this.broadcastSnapshot(room);
   }
@@ -360,17 +381,28 @@ export class GameHub {
     if (!room || room.snapshot.state.phase !== "playing") return;
     const side = sideFor(room, client);
     if (!side) return;
-    const previousSequence = client.lastInputSequenceByRoom.get(roomId) ?? -1;
-    if (inputSeq <= previousSequence) return;
-    client.lastInputSequenceByRoom.set(roomId, inputSeq);
+    const decision = this.inputGate.check({
+      userId: client.user.id,
+      roomId,
+      inputSeq,
+      nowMs: performance.now()
+    });
+    if (decision === "stale") return;
+    if (decision === "rate_limited") {
+      this.send(client, {
+        type: "error",
+        code: "rate_limited",
+        message: "게임 입력 전송 한도를 초과했습니다."
+      });
+      return;
+    }
     room.snapshot.state.paddles[side].dy = direction;
   }
 
   private pauseRoom(client: Client, roomId: string): void {
     const room = this.rooms.get(roomId);
     if (!room || room.snapshot.state.phase !== "playing" || !sideFor(room, client)) return;
-    if (room.timer) clearInterval(room.timer);
-    room.timer = null;
+    room.scheduler?.stop();
     room.snapshot.state.phase = "paused";
     this.broadcastSnapshot(room);
   }
@@ -379,13 +411,20 @@ export class GameHub {
     const room = this.rooms.get(roomId);
     if (!room || room.snapshot.state.phase !== "paused" || !sideFor(room, client)) return;
     room.snapshot.state.phase = "playing";
-    if (!room.timer) {
-      room.timer = setInterval(() => this.tick(room).catch(() => undefined), SIMULATION_TIMESTEP_MS);
-    }
+    this.startRoomScheduler(room);
     this.broadcastSnapshot(room);
   }
 
-  private async tick(room: Room): Promise<void> {
+  private startRoomScheduler(room: Room): void {
+    room.scheduler ??= new FixedStepScheduler(() => this.tick(room), {
+      timestepMs: SIMULATION_TIMESTEP_MS,
+      maxTicksPerLoop: 5,
+      maxAccumulatedMs: 250
+    });
+    room.scheduler.start();
+  }
+
+  private tick(room: Room): void {
     if (room.snapshot.state.phase !== "playing") return;
     const rightDirection = room.aiController
       ? room.aiController.nextDirection(room.simulation)
@@ -398,7 +437,7 @@ export class GameHub {
     this.broadcastSnapshot(room);
 
     if (room.simulation.phase === "finished" && room.simulation.winnerSide) {
-      await this.finishRoom(room, room.simulation.winnerSide);
+      this.finishRoom(room, room.simulation.winnerSide).catch(() => undefined);
     }
   }
 
@@ -413,8 +452,7 @@ export class GameHub {
   }
 
   private async finalizeRoom(room: Room, winnerSide: PlayerSide): Promise<void> {
-    if (room.timer) clearInterval(room.timer);
-    room.timer = null;
+    room.scheduler?.stop();
     room.snapshot.state.phase = "finished";
     const leftUser = room.clients.left?.user ?? null;
     const rightUser = room.clients.right?.user ?? room.npcUser ?? null;
@@ -478,9 +516,19 @@ export class GameHub {
   }
 
   private send(client: Client, event: VersionlessServerEvent): void {
-    if (client.socket.readyState === WebSocket.OPEN) {
-      client.socket.send(encodeServerEvent({ ...event, v: 1 } as ServerEvent));
+    if (client.socket.readyState !== WebSocket.OPEN) return;
+    const payload = encodeServerEvent({ ...event, v: 1 } as ServerEvent);
+    if (event.type === "game.snapshot") {
+      client.snapshots.enqueue(payload);
+      return;
     }
+    if (client.socket.bufferedAmount >= HARD_BUFFERED_AMOUNT_BYTES) {
+      client.socket.terminate();
+      return;
+    }
+    client.socket.send(payload, (error) => {
+      if (error && client.socket.readyState === WebSocket.OPEN) client.socket.terminate();
+    });
   }
 }
 
