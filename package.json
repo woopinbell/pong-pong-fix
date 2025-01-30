@@ -15,6 +15,7 @@
     "postgres-integration": "pnpm --filter @pong-pong/db postgres-integration",
     "smoke:http": "node tests/smoke-api.mjs",
     "smoke:ws": "node tests/smoke-ws.mjs",
+    "verify:build": "node tests/build-artifacts.mjs",
     "e2e": "playwright test",
     "test:e2e": "pnpm e2e",
     "dev": "pnpm --parallel --filter @pong-pong/api --filter @pong-pong/web dev"
