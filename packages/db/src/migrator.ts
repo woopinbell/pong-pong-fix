@@ -10,6 +10,7 @@ import {
   type MigrationProvider
 } from "kysely";
 import { Pool } from "pg";
+import type { Database } from "./schema";
 
 const migrationsDirectory = fileURLToPath(
   new URL("../migrations", import.meta.url)
@@ -40,7 +41,7 @@ class SqlMigrationProvider implements MigrationProvider {
 
 export async function migrateDatabase(databaseUrl: string): Promise<void> {
   const pool = new Pool({ connectionString: databaseUrl });
-  const db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
+  const db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) });
 
   try {
     const migrator = new Migrator({

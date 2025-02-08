@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Kysely, PostgresDialect, sql } from "kysely";
+import { Kysely, PostgresDialect, sql, type Transaction } from "kysely";
 import { Pool } from "pg";
 import type {
   ChatMessage,
@@ -13,29 +13,51 @@ import type {
   SessionUser,
   TournamentMatchSummary,
   TournamentSummary,
-  UserRole,
-  UserStatus
+  UserRole
 } from "@pong-pong/shared";
+import {
+  toAdminActionSummary,
+  toChatMessage,
+  toFriendSummary,
+  toMatchSummary,
+  toPublicUser,
+  toSessionUser,
+  toTournamentMatchRecord,
+  toTournamentMatchSummary,
+  toTournamentSummary
+} from "./rowMappers";
+import type {
+  AdminActionRow,
+  ChatMessageRow,
+  ChatMessageWithSenderRow,
+  Database,
+  FriendshipWithUserRow,
+  MatchWithHandlesRow,
+  TournamentMatchRow,
+  TournamentRow,
+  TournamentWithCreatorRow,
+  UserProjectionRow,
+  UserRow
+} from "./schema";
 
-type RawUser = {
-  id: string;
-  email: string | null;
-  handle: string;
-  display_name: string;
-  avatar_key: string;
-  role: UserRole;
-  status: UserStatus;
-  rating: number;
-  wins: number;
-  losses: number;
-  is_npc: boolean;
-};
+export type { Database } from "./schema";
 
 type MemoryFriendship = {
   id: string;
   requesterId: string;
   addresseeId: string;
   status: FriendSummary["status"];
+};
+
+type MemoryMatchRecord = {
+  id: string;
+  resultKey: string;
+  mode: MatchMode;
+  winnerId: string | null;
+  loserId: string | null;
+  scoreLeft: number;
+  scoreRight: number;
+  endedAt: string;
 };
 
 export interface DevLoginInput {
@@ -137,7 +159,7 @@ export interface AppRepository {
 
 export function createPostgresRepository(databaseUrl: string): AppRepository {
   const pool = new Pool({ connectionString: databaseUrl });
-  const db = new Kysely<any>({ dialect: new PostgresDialect({ pool }) });
+  const db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) });
   return new PostgresRepository(db, pool);
 }
 
@@ -147,7 +169,7 @@ export function createMemoryRepository(): AppRepository {
 
 class PostgresRepository implements AppRepository {
   constructor(
-    private readonly db: Kysely<any>,
+    private readonly db: Kysely<Database>,
     private readonly pool: Pool
   ) {}
 
@@ -185,7 +207,7 @@ class PostgresRepository implements AppRepository {
     const handle = normalizeHandle(input.handle);
     const email = input.email ?? `${handle}@dev.pong-pong.local`;
     const displayName = input.displayName.trim() || handle;
-    const result = await sql<RawUser>`
+    const result = await sql<UserRow>`
       insert into users (email, handle, display_name, avatar_key, role, is_npc)
       values (${email}, ${handle}, ${displayName}, ${avatarFor(handle)}, 'user', false)
       on conflict (handle) do update set
@@ -222,7 +244,7 @@ class PostgresRepository implements AppRepository {
 
   async getSessionUser(token: string | undefined): Promise<SessionUser | null> {
     if (!token) return null;
-    const result = await sql<RawUser>`
+    const result = await sql<UserRow>`
       select u.*
       from sessions s
       join users u on u.id = s.user_id
@@ -253,7 +275,7 @@ class PostgresRepository implements AppRepository {
 
   async consumeWsTicket(ticketHash: string): Promise<SessionUser | null> {
     assertWsTicketHash(ticketHash);
-    const result = await sql<RawUser>`
+    const result = await sql<UserRow>`
       with consumed as (
         delete from ws_tickets
         where ticket_hash = ${ticketHash}
@@ -269,7 +291,7 @@ class PostgresRepository implements AppRepository {
   }
 
   async setUserRoleByHandle(handle: string, role: UserRole): Promise<PublicUser> {
-    const result = await sql<RawUser>`
+    const result = await sql<UserRow>`
       update users
       set role = ${role}
       where handle = ${normalizeHandle(handle)} and is_npc = false
@@ -280,19 +302,19 @@ class PostgresRepository implements AppRepository {
   }
 
   async getUserById(id: string): Promise<PublicUser | null> {
-    const result = await sql<RawUser>`select * from users where id = ${id} limit 1`.execute(this.db);
+    const result = await sql<UserRow>`select * from users where id = ${id} limit 1`.execute(this.db);
     return result.rows[0] ? toPublicUser(result.rows[0]) : null;
   }
 
   async getUserByHandle(handle: string): Promise<PublicUser | null> {
-    const result = await sql<RawUser>`select * from users where handle = ${normalizeHandle(handle)} limit 1`.execute(this.db);
+    const result = await sql<UserRow>`select * from users where handle = ${normalizeHandle(handle)} limit 1`.execute(this.db);
     return result.rows[0] ? toPublicUser(result.rows[0]) : null;
   }
 
   async updateProfile(userId: string, input: { displayName?: string; avatarKey?: string }): Promise<SessionUser> {
-    const current = await sql<RawUser>`select * from users where id = ${userId} limit 1`.execute(this.db);
+    const current = await sql<UserRow>`select * from users where id = ${userId} limit 1`.execute(this.db);
     const user = firstRow(current);
-    const result = await sql<RawUser>`
+    const result = await sql<UserRow>`
       update users
       set display_name = ${input.displayName ?? user.display_name},
           avatar_key = ${input.avatarKey ?? user.avatar_key}
@@ -303,17 +325,17 @@ class PostgresRepository implements AppRepository {
   }
 
   async listOnlineUsers(): Promise<PublicUser[]> {
-    const result = await sql<RawUser>`select * from users where status = 'active' order by rating desc limit 12`.execute(this.db);
+    const result = await sql<UserRow>`select * from users where status = 'active' order by rating desc limit 12`.execute(this.db);
     return result.rows.map((row) => toPublicUser(row, true));
   }
 
   async listNpcOpponents(): Promise<PublicUser[]> {
-    const result = await sql<RawUser>`select * from users where status = 'active' and is_npc = true order by rating asc`.execute(this.db);
+    const result = await sql<UserRow>`select * from users where status = 'active' and is_npc = true order by rating asc`.execute(this.db);
     return result.rows.map((row) => toPublicUser(row, false));
   }
 
   async listLeaderboard(): Promise<LeaderboardEntry[]> {
-    const result = await sql<RawUser>`select * from users order by rating desc, wins desc limit 20`.execute(this.db);
+    const result = await sql<UserRow>`select * from users order by rating desc, wins desc limit 20`.execute(this.db);
     return result.rows.map((row, index) => ({
       rank: index + 1,
       user: toPublicUser(row, false),
@@ -323,7 +345,7 @@ class PostgresRepository implements AppRepository {
 
   async listRecentMatches(userId?: string): Promise<MatchSummary[]> {
     const result = userId
-      ? await sql<any>`
+      ? await sql<MatchWithHandlesRow>`
         select m.*, winner.handle as winner_handle, loser.handle as loser_handle
         from matches m
         left join users winner on winner.id = m.winner_id
@@ -332,7 +354,7 @@ class PostgresRepository implements AppRepository {
         order by m.ended_at desc
         limit 8
       `.execute(this.db)
-      : await sql<any>`
+      : await sql<MatchWithHandlesRow>`
         select m.*, winner.handle as winner_handle, loser.handle as loser_handle
         from matches m
         left join users winner on winner.id = m.winner_id
@@ -340,7 +362,7 @@ class PostgresRepository implements AppRepository {
         order by m.ended_at desc
         limit 8
       `.execute(this.db);
-    return result.rows.map((row) => matchSummary(row, userId));
+    return result.rows.map((row) => toMatchSummary(row, userId));
   }
 
   async getDashboard(userId: string): Promise<DashboardSummary> {
@@ -356,18 +378,14 @@ class PostgresRepository implements AppRepository {
   }
 
   async listFriends(userId: string): Promise<FriendSummary[]> {
-    const result = await sql<any>`
+    const result = await sql<FriendshipWithUserRow>`
       select f.id as friendship_id, f.status as friendship_status, u.*
       from friendships f
       join users u on u.id = case when f.requester_id = ${userId} then f.addressee_id else f.requester_id end
       where f.requester_id = ${userId} or f.addressee_id = ${userId}
       order by f.updated_at desc
     `.execute(this.db);
-    return result.rows.map((row) => ({
-      id: row.friendship_id,
-      status: row.friendship_status,
-      user: toPublicUser(row, true)
-    }));
+    return result.rows.map(toFriendSummary);
   }
 
   async requestFriend(requesterId: string, addresseeHandle: string): Promise<FriendSummary> {
@@ -637,7 +655,7 @@ class PostgresRepository implements AppRepository {
   }
 
   async listLobbyChat(): Promise<ChatMessage[]> {
-    const result = await sql<any>`
+    const result = await sql<ChatMessageWithSenderRow>`
       select c.*, u.id as user_id, u.email, u.handle, u.display_name, u.avatar_key, u.role, u.status, u.rating, u.wins, u.losses, u.is_npc
       from chat_messages c
       join users u on u.id = c.sender_id
@@ -645,11 +663,11 @@ class PostgresRepository implements AppRepository {
       order by c.created_at desc
       limit 20
     `.execute(this.db);
-    return result.rows.reverse().map(chatRow);
+    return result.rows.reverse().map(toChatMessage);
   }
 
   async createChatMessage(input: { scope: "lobby" | "match"; roomId?: string | null; senderId: string; body: string }): Promise<ChatMessage> {
-    const result = await sql<any>`
+    const result = await sql<ChatMessageRow>`
       insert into chat_messages (scope, room_id, sender_id, body)
       values (${input.scope}, ${input.roomId ?? null}, ${input.senderId}, ${input.body})
       returning *
@@ -668,7 +686,7 @@ class PostgresRepository implements AppRepository {
   }
 
   async listTournaments(): Promise<TournamentSummary[]> {
-    const result = await sql<any>`
+    const result = await sql<TournamentWithCreatorRow>`
       select t.*, u.id as creator_id, u.email, u.handle, u.display_name, u.avatar_key, u.role, u.status as user_status, u.rating, u.wins, u.losses, u.is_npc
       from tournaments t
       join users u on u.id = t.created_by
@@ -683,7 +701,7 @@ class PostgresRepository implements AppRepository {
   }
 
   async createTournament(input: { name: string; createdBy: string }): Promise<TournamentSummary> {
-    const result = await sql<any>`
+    const result = await sql<TournamentRow>`
       insert into tournaments (name, created_by, capacity)
       values (${input.name}, ${input.createdBy}, 4)
       returning *
@@ -743,8 +761,8 @@ class PostgresRepository implements AppRepository {
   }
 
   async getTournamentMatch(matchId: string): Promise<TournamentMatchRecord | null> {
-    const result = await sql<any>`select * from tournament_matches where id = ${matchId} limit 1`.execute(this.db);
-    return result.rows[0] ? tournamentMatchRecord(result.rows[0]) : null;
+    const result = await sql<TournamentMatchRow>`select * from tournament_matches where id = ${matchId} limit 1`.execute(this.db);
+    return result.rows[0] ? toTournamentMatchRecord(result.rows[0]) : null;
   }
 
   async startTournamentMatch(matchId: string, roomId: string): Promise<void> {
@@ -756,7 +774,7 @@ class PostgresRepository implements AppRepository {
   }
 
   async completeTournamentMatch(input: { tournamentMatchId: string; roomId: string; matchId: string; winnerId: string | null; scoreLeft: number; scoreRight: number }): Promise<TournamentSummary> {
-    const updated = await sql<any>`
+    const updated = await sql<TournamentMatchRow>`
       update tournament_matches
       set status = 'finished',
           room_id = ${input.roomId},
@@ -781,29 +799,25 @@ class PostgresRepository implements AppRepository {
   }
 
   async listAdminUsers(): Promise<PublicUser[]> {
-    const result = await sql<RawUser>`select * from users order by created_at desc limit 50`.execute(this.db);
+    const result = await sql<UserRow>`select * from users order by created_at desc limit 50`.execute(this.db);
     return result.rows.map((row) => toPublicUser(row, true));
   }
 
   async listAdminActions(): Promise<AdminActionSummary[]> {
-    const result = await sql<any>`
+    const result = await sql<AdminActionRow>`
       select *
       from admin_actions
       order by created_at desc
       limit 30
     `.execute(this.db);
-    return Promise.all(result.rows.map(async (row) => ({
-      id: row.id,
+    return Promise.all(result.rows.map(async (row) => toAdminActionSummary(row, {
       actor: row.actor_id ? await this.getUserById(row.actor_id) : null,
-      target: row.target_user_id ? await this.getUserById(row.target_user_id) : null,
-      action: row.action,
-      reason: row.reason,
-      createdAt: new Date(row.created_at).toISOString()
+      target: row.target_user_id ? await this.getUserById(row.target_user_id) : null
     })));
   }
 
   async setUserBan(actorId: string, targetUserId: string, banned: boolean, reason: string): Promise<PublicUser> {
-    const result = await sql<RawUser>`
+    const result = await sql<UserRow>`
       update users
       set status = ${banned ? "banned" : "active"}, banned_at = ${banned ? sql`now()` : null}
       where id = ${targetUserId}
@@ -816,46 +830,31 @@ class PostgresRepository implements AppRepository {
     return toPublicUser(firstRow(result));
   }
 
-  private async tournamentFromRow(row: any): Promise<TournamentSummary> {
-    const entries = await sql<RawUser>`
+  private async tournamentFromRow(row: TournamentWithCreatorRow): Promise<TournamentSummary> {
+    const entries = await sql<UserRow>`
       select u.*
       from tournament_entries e
       join users u on u.id = e.user_id
       where e.tournament_id = ${row.id}
       order by e.seed asc
     `.execute(this.db);
-    const matches = await sql<any>`
+    const matches = await sql<TournamentMatchRow>`
       select *
       from tournament_matches
       where tournament_id = ${row.id}
       order by case when round = 'semifinal' then 1 else 2 end, slot asc
     `.execute(this.db);
-    return {
-      id: row.id,
-      name: row.name,
-      status: row.status,
-      createdBy: toPublicUser({
-        id: row.creator_id,
-        email: row.email,
-        handle: row.handle,
-        display_name: row.display_name,
-        avatar_key: row.avatar_key,
-        role: row.role,
-        status: row.user_status,
-        rating: row.rating,
-        wins: row.wins,
-        losses: row.losses,
-        is_npc: row.is_npc
-      }),
-      playerCount: entries.rows.length,
-      capacity: row.capacity,
-      winner: row.winner_id ? await this.getUserById(row.winner_id) : null,
+    return toTournamentSummary(row, {
       entries: entries.rows.map((entry) => toPublicUser(entry, true)),
-      matches: await Promise.all(matches.rows.map((match) => this.tournamentMatchFromRow(match)))
-    };
+      matches: await Promise.all(matches.rows.map((match) => this.tournamentMatchFromRow(match))),
+      winner: row.winner_id ? await this.getUserById(row.winner_id) : null
+    });
   }
 
-  private async ensureTournamentBracket(tournamentId: string, executor: Kysely<any> = this.db): Promise<void> {
+  private async ensureTournamentBracket(
+    tournamentId: string,
+    executor: Kysely<Database> | Transaction<Database> = this.db
+  ): Promise<void> {
     const entries = await sql<{ user_id: string; seed: number }>`
       select user_id, seed
       from tournament_entries
@@ -887,29 +886,20 @@ class PostgresRepository implements AppRepository {
     `.execute(this.db);
   }
 
-  private async tournamentMatchFromRow(row: any): Promise<TournamentMatchSummary> {
-    return {
-      id: row.id,
-      tournamentId: row.tournament_id,
-      round: row.round,
-      slot: Number(row.slot),
-      status: row.status,
+  private async tournamentMatchFromRow(row: TournamentMatchRow): Promise<TournamentMatchSummary> {
+    return toTournamentMatchSummary(row, {
       left: row.left_user_id ? await this.getUserById(row.left_user_id) : null,
       right: row.right_user_id ? await this.getUserById(row.right_user_id) : null,
-      winner: row.winner_id ? await this.getUserById(row.winner_id) : null,
-      scoreLeft: row.score_left == null ? null : Number(row.score_left),
-      scoreRight: row.score_right == null ? null : Number(row.score_right),
-      roomId: row.room_id,
-      matchId: row.match_id
-    };
+      winner: row.winner_id ? await this.getUserById(row.winner_id) : null
+    });
   }
 }
 
 class MemoryRepository implements AppRepository {
-  private readonly users = new Map<string, RawUser>();
+  private readonly users = new Map<string, UserProjectionRow>();
   private readonly sessions = new Map<string, string>();
   private readonly wsTickets = new Map<string, { userId: string; expiresAt: number }>();
-  private readonly matches: Array<any> = [];
+  private readonly matches: MemoryMatchRecord[] = [];
   private readonly chats: ChatMessage[] = [];
   private readonly friendships: MemoryFriendship[] = [];
   private readonly tournaments: TournamentSummary[] = [];
@@ -935,7 +925,7 @@ class MemoryRepository implements AppRepository {
     }
     for (const npc of NPC_PLAYERS) {
       const existing = [...this.users.values()].find((user) => user.handle === npc.handle);
-      const user: RawUser = existing ?? {
+      const user: UserProjectionRow = existing ?? {
         id: randomUUID(),
         email: null,
         handle: npc.handle,
@@ -960,7 +950,7 @@ class MemoryRepository implements AppRepository {
   async upsertDevUser(input: DevLoginInput): Promise<SessionUser> {
     const handle = normalizeHandle(input.handle);
     const existing = [...this.users.values()].find((user) => user.handle === handle);
-    const user: RawUser = existing ?? {
+    const user: UserProjectionRow = existing ?? {
       id: randomUUID(),
       email: input.email ?? `${handle}@dev.pong-pong.local`,
       handle,
@@ -1063,7 +1053,7 @@ class MemoryRepository implements AppRepository {
       .filter((match) => !userId || match.winnerId === userId || match.loserId === userId)
       .slice(-8)
       .reverse()
-      .map((match) => matchSummary(match, userId));
+      .map((match) => memoryMatchSummary(match, userId));
   }
 
   async getDashboard(userId: string): Promise<DashboardSummary> {
@@ -1178,9 +1168,14 @@ class MemoryRepository implements AppRepository {
 
     const matchId = randomUUID();
     this.matches.push({
-      ...command,
       id: matchId,
-      ended_at: new Date().toISOString()
+      resultKey: command.resultKey,
+      mode: command.mode,
+      winnerId: command.winnerId,
+      loserId: command.loserId,
+      scoreLeft: command.scoreLeft,
+      scoreRight: command.scoreRight,
+      endedAt: new Date().toISOString()
     });
 
     if (winner) {
@@ -1419,26 +1414,6 @@ function avatarFor(handle: string): string {
   return avatars[Math.abs([...handle].reduce((sum, char) => sum + char.charCodeAt(0), 0)) % avatars.length];
 }
 
-function toPublicUser(row: RawUser, online = false): PublicUser {
-  return {
-    id: row.id,
-    handle: row.handle,
-    displayName: row.display_name,
-    avatarKey: row.avatar_key,
-    role: row.role,
-    status: row.status,
-    rating: Number(row.rating),
-    wins: Number(row.wins),
-    losses: Number(row.losses),
-    online,
-    isNpc: Boolean(row.is_npc)
-  };
-}
-
-function toSessionUser(row: RawUser, online = false): SessionUser {
-  return { ...toPublicUser(row, online), email: row.email };
-}
-
 function percentage(wins: number, losses: number): number {
   const total = Number(wins) + Number(losses);
   if (total === 0) return 0;
@@ -1459,30 +1434,17 @@ function bestWinningStreak(matches: MatchSummary[]): number {
   return best;
 }
 
-function matchSummary(row: any, userId?: string): MatchSummary {
-  const won = userId ? row.winner_id === userId || row.winnerId === userId : true;
+function memoryMatchSummary(row: MemoryMatchRecord, userId?: string): MatchSummary {
+  const won = userId ? row.winnerId === userId : true;
   return {
     id: row.id,
     mode: row.mode,
-    opponentHandle: won ? row.loser_handle ?? "AI" : row.winner_handle ?? "AI",
+    opponentHandle: "AI",
     result: won ? "win" : "loss",
-    scoreLeft: Number(row.score_left ?? row.scoreLeft),
-    scoreRight: Number(row.score_right ?? row.scoreRight),
-    ratingDelta: won ? Number(row.rating_delta ?? 16) : -12,
-    endedAt: new Date(row.ended_at ?? row.endedAt ?? Date.now()).toISOString()
-  };
-}
-
-function tournamentMatchRecord(row: any): TournamentMatchRecord {
-  return {
-    id: row.id,
-    tournamentId: row.tournament_id,
-    round: row.round,
-    slot: Number(row.slot),
-    status: row.status,
-    leftUserId: row.left_user_id,
-    rightUserId: row.right_user_id,
-    winnerId: row.winner_id
+    scoreLeft: row.scoreLeft,
+    scoreRight: row.scoreRight,
+    ratingDelta: won ? 16 : -12,
+    endedAt: row.endedAt
   };
 }
 
@@ -1500,28 +1462,5 @@ function memoryTournamentMatch(tournamentId: string, round: "semifinal" | "final
     scoreRight: null,
     roomId: null,
     matchId: null
-  };
-}
-
-function chatRow(row: any): ChatMessage {
-  return {
-    id: row.id,
-    scope: row.scope,
-    roomId: row.room_id,
-    sender: toPublicUser({
-      id: row.user_id,
-      email: row.email,
-      handle: row.handle,
-      display_name: row.display_name,
-      avatar_key: row.avatar_key,
-      role: row.role,
-      status: row.status,
-      rating: row.rating,
-      wins: row.wins,
-      losses: row.losses,
-      is_npc: row.is_npc
-    }),
-    body: row.body,
-    createdAt: new Date(row.created_at).toISOString()
   };
 }
