@@ -11,7 +11,8 @@ import {
   type PlayerSide,
   type PublicUser,
   type ServerEvent,
-  type SessionUser
+  type SessionUser,
+  WINNING_SCORE
 } from "@pong-pong/shared";
 import { DEFAULT_TIMESTEP_MS, FixedStepScheduler } from "./game/fixedStepScheduler";
 import { ConnectionHeartbeat } from "./game/heartbeat";
@@ -19,6 +20,7 @@ import { InputGate } from "./game/inputGate";
 import { HARD_BUFFERED_AMOUNT_BYTES, LatestSnapshotBuffer } from "./game/latestSnapshotBuffer";
 import { PongAi } from "./game/pongAi";
 import { PongSimulation, type PongSimulationState } from "./game/pongSimulation";
+import { RoomSession } from "./game/roomSession";
 
 type Client = {
   id: string;
@@ -54,13 +56,19 @@ type Room = {
   simulation: PongSimulationState;
   aiController: PongAi | null;
   finishing: Promise<void> | null;
+  session: RoomSession;
+  reconnectTimer: NodeJS.Timeout | null;
+  disconnectedUsers: Partial<Record<PlayerSide, string>>;
 };
 
 const NPC_QUEUE_FALLBACK_MS = 6000;
 const SIMULATION_TIMESTEP_MS = DEFAULT_TIMESTEP_MS;
+const CONNECTION_REPLACED_CLOSE_CODE = 4001;
+const CONNECTION_REPLACED_REASON = "connection replaced";
 
 export class GameHub {
   private readonly clients = new Map<string, Client>();
+  private readonly clientsByUser = new Map<string, Client>();
   private readonly queue: QueueEntry[] = [];
   private readonly rooms = new Map<string, Room>();
   private readonly tournamentWaiters = new Map<string, Client[]>();
@@ -84,11 +92,17 @@ export class GameHub {
       heartbeat,
       snapshots: new LatestSnapshotBuffer(socket)
     };
+    const previous = this.clientsByUser.get(user.id);
     this.clients.set(client.id, client);
+    this.clientsByUser.set(user.id, client);
     socket.on("message", (payload) => this.receive(client, payload.toString()));
     socket.on("pong", () => heartbeat.acknowledge());
     socket.on("close", () => this.disconnect(client));
-    heartbeat.start();
+    if (previous) this.replaceConnection(previous, client);
+    else this.recoverConnection(client);
+    if (this.clients.get(client.id) === client && socket.readyState === WebSocket.OPEN) {
+      heartbeat.start();
+    }
     this.broadcastPresence();
     for (const payload of pendingPayloads) {
       this.receive(client, payload).catch(() => undefined);
@@ -96,6 +110,7 @@ export class GameHub {
   }
 
   private async receive(client: Client, payload: string): Promise<void> {
+    if (this.clients.get(client.id) !== client) return;
     try {
       const event = parseClientEvent(payload);
       if (event.type === "queue.join") await this.joinQueue(client, event.mode);
@@ -134,19 +149,139 @@ export class GameHub {
     this.leaveQueue(client);
     this.leaveTournamentWaiters(client);
     this.clients.delete(client.id);
-    if (![...this.clients.values()].some((candidate) => candidate.user.id === client.user.id)) {
-      this.inputGate.releaseUser(client.user.id);
+    if (this.clientsByUser.get(client.user.id)?.id === client.id) {
+      this.clientsByUser.delete(client.user.id);
     }
+    this.inputGate.releaseUser(client.user.id);
     if (client.roomId) {
       const room = this.rooms.get(client.roomId);
-      if (room) {
-        this.finishRoom(room, client === room.clients.left ? "right" : "left").catch(() => undefined);
-      }
+      const side = room ? sideFor(room, client) : null;
+      if (room && side) this.reserveRoomSide(room, side, client.user.id);
     }
     this.broadcastPresence();
   }
 
+  private replaceConnection(previous: Client, replacement: Client): void {
+    previous.heartbeat.stop();
+    previous.snapshots.close();
+    this.leaveQueue(previous);
+    this.leaveTournamentWaiters(previous);
+    this.clients.delete(previous.id);
+    this.inputGate.releaseUser(previous.user.id);
+
+    if (previous.roomId) {
+      const room = this.rooms.get(previous.roomId);
+      const side = room ? sideFor(room, previous) : null;
+      if (room && side) {
+        room.clients[side] = replacement;
+        replacement.roomId = room.id;
+        previous.roomId = null;
+        this.sendMatchContext(replacement, room, side);
+        this.send(replacement, { type: "game.snapshot", snapshot: room.snapshot });
+      }
+    }
+
+    if (previous.socket.readyState === WebSocket.OPEN) {
+      previous.socket.close(CONNECTION_REPLACED_CLOSE_CODE, CONNECTION_REPLACED_REASON);
+    }
+  }
+
+  private recoverConnection(client: Client): boolean {
+    const nowMs = Date.now();
+    for (const room of this.rooms.values()) {
+      for (const side of ["left", "right"] as const) {
+        if (room.disconnectedUsers[side] !== client.user.id) continue;
+        if (!room.session.reconnect(side, nowMs)) continue;
+
+        const disconnected = room.clients[side];
+        if (disconnected) disconnected.roomId = null;
+        room.clients[side] = client;
+        client.roomId = room.id;
+        delete room.disconnectedUsers[side];
+        this.sendMatchContext(client, room, side);
+
+        if (room.session.state === "reconnecting") {
+          this.send(client, { type: "game.snapshot", snapshot: room.snapshot });
+        } else {
+          this.clearReconnectTimer(room);
+          room.snapshot.state.phase = room.session.state;
+          if (room.session.state === "playing") this.startRoomScheduler(room);
+          this.broadcastSnapshot(room);
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private reserveRoomSide(room: Room, side: PlayerSide, userId: string): void {
+    if (room.finishing || room.session.state === "finished") return;
+    room.session.disconnect(side, Date.now());
+    room.disconnectedUsers[side] = userId;
+    room.scheduler?.stop();
+    room.snapshot.state.paddles[side].dy = 0;
+    room.snapshot.state.phase = "paused";
+    this.armReconnectTimer(room);
+    this.broadcastSnapshot(room);
+  }
+
+  private armReconnectTimer(room: Room): void {
+    this.clearReconnectTimer(room);
+    const deadline = room.session.reconnectDeadline;
+    if (deadline === null) return;
+    room.reconnectTimer = setTimeout(() => this.expireReconnect(room.id), Math.max(0, deadline - Date.now()));
+  }
+
+  private expireReconnect(roomId: string): void {
+    const room = this.rooms.get(roomId);
+    if (!room || room.finishing) return;
+    room.reconnectTimer = null;
+    const expiry = room.session.expireReconnect(Date.now());
+    if (!expiry) {
+      this.armReconnectTimer(room);
+      return;
+    }
+
+    room.disconnectedUsers = {};
+    if (!expiry.winnerSide) {
+      this.abandonRoom(room);
+      return;
+    }
+    if (expiry.winnerSide === "left") {
+      room.snapshot.state.leftScore = Math.max(room.snapshot.state.leftScore, WINNING_SCORE);
+    } else {
+      room.snapshot.state.rightScore = Math.max(room.snapshot.state.rightScore, WINNING_SCORE);
+    }
+    this.finishRoom(room, expiry.winnerSide).catch(() => undefined);
+  }
+
+  private abandonRoom(room: Room): void {
+    room.scheduler?.stop();
+    this.clearReconnectTimer(room);
+    for (const client of Object.values(room.clients)) {
+      if (client) client.roomId = null;
+    }
+    this.rooms.delete(room.id);
+    this.broadcastPresence();
+  }
+
+  private clearReconnectTimer(room: Room): void {
+    if (room.reconnectTimer) clearTimeout(room.reconnectTimer);
+    room.reconnectTimer = null;
+  }
+
+  private sendMatchContext(client: Client, room: Room, side: PlayerSide): void {
+    const opponent = side === "left"
+      ? room.clients.right?.user.displayName ?? room.npcUser?.displayName ?? "연습 AI"
+      : room.clients.left?.user.displayName ?? "상대 선수";
+    this.send(client, { type: "queue.matched", roomId: room.id, side, opponent });
+  }
+
   private async joinQueue(client: Client, mode: "queue" | "ai"): Promise<void> {
+    if (client.roomId) {
+      this.send(client, { type: "error", code: "forbidden", message: "이미 진행 중인 경기가 있습니다." });
+      return;
+    }
     this.leaveQueue(client);
     this.pruneQueue();
     if (mode === "ai") {
@@ -306,6 +441,8 @@ export class GameHub {
     const npcUser = options.npc ?? null;
     const rightPlayer = right?.user ?? npcUser;
     const simulation = PongSimulation.initialState();
+    const session = new RoomSession();
+    if (options.ai) session.markReady("right");
     const room: Room = {
       id: roomId,
       clients: { left, ...(right ? { right } : {}) },
@@ -318,6 +455,9 @@ export class GameHub {
       simulation,
       aiController: options.ai ? new PongAi(roomId, npcUser?.rating ?? 1200) : null,
       finishing: null,
+      session,
+      reconnectTimer: null,
+      disconnectedUsers: {},
       snapshot: {
         roomId,
         tick: 0,
@@ -369,8 +509,9 @@ export class GameHub {
       if (player.side === side) player.ready = true;
     }
     if (room.ai) room.ready.right = true;
-    if (room.ready.left && room.ready.right && room.snapshot.state.phase === "waiting") {
-      room.snapshot.state.phase = "playing";
+    const sessionState = room.session.markReady(side);
+    if (room.ready.left && room.ready.right && sessionState === "playing") {
+      room.snapshot.state.phase = sessionState;
       this.startRoomScheduler(room);
     }
     this.broadcastSnapshot(room);
@@ -403,14 +544,18 @@ export class GameHub {
     const room = this.rooms.get(roomId);
     if (!room || room.snapshot.state.phase !== "playing" || !sideFor(room, client)) return;
     room.scheduler?.stop();
-    room.snapshot.state.phase = "paused";
+    const sessionState = room.session.pause();
+    if (sessionState !== "paused") return;
+    room.snapshot.state.phase = sessionState;
     this.broadcastSnapshot(room);
   }
 
   private resumeRoom(client: Client, roomId: string): void {
     const room = this.rooms.get(roomId);
     if (!room || room.snapshot.state.phase !== "paused" || !sideFor(room, client)) return;
-    room.snapshot.state.phase = "playing";
+    const sessionState = room.session.resume();
+    if (sessionState !== "playing") return;
+    room.snapshot.state.phase = sessionState;
     this.startRoomScheduler(room);
     this.broadcastSnapshot(room);
   }
@@ -453,6 +598,9 @@ export class GameHub {
 
   private async finalizeRoom(room: Room, winnerSide: PlayerSide): Promise<void> {
     room.scheduler?.stop();
+    this.clearReconnectTimer(room);
+    room.disconnectedUsers = {};
+    room.session.finish();
     room.snapshot.state.phase = "finished";
     const leftUser = room.clients.left?.user ?? null;
     const rightUser = room.clients.right?.user ?? room.npcUser ?? null;
