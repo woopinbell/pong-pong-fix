@@ -21,11 +21,14 @@ import { HARD_BUFFERED_AMOUNT_BYTES, LatestSnapshotBuffer } from "./game/latestS
 import { PongAi } from "./game/pongAi";
 import { PongSimulation, type PongSimulationState } from "./game/pongSimulation";
 import { RoomSession } from "./game/roomSession";
+import type { GuestSessionUser } from "./guestAccess.js";
+
+type ConnectedUser = SessionUser | GuestSessionUser;
 
 type Client = {
   id: string;
   socket: WebSocket;
-  user: SessionUser;
+  user: ConnectedUser;
   roomId: string | null;
   heartbeat: ConnectionHeartbeat;
   snapshots: LatestSnapshotBuffer;
@@ -59,12 +62,14 @@ type Room = {
   session: RoomSession;
   reconnectTimer: NodeJS.Timeout | null;
   disconnectedUsers: Partial<Record<PlayerSide, string>>;
+  guest: boolean;
 };
 
 const NPC_QUEUE_FALLBACK_MS = 6000;
 const SIMULATION_TIMESTEP_MS = DEFAULT_TIMESTEP_MS;
 const CONNECTION_REPLACED_CLOSE_CODE = 4001;
 const CONNECTION_REPLACED_REASON = "connection replaced";
+const GUEST_RESULT_RETENTION_MS = 2 * 60 * 1_000;
 
 export class GameHub {
   private readonly clients = new Map<string, Client>();
@@ -74,10 +79,19 @@ export class GameHub {
   private readonly tournamentWaiters = new Map<string, Client[]>();
   private readonly waitSamples: number[] = [];
   private readonly inputGate = new InputGate();
+  private readonly recentGuestResults = new Map<string, {
+    result: GameFinished;
+    expiresAtMs: number;
+    cleanupTimer: NodeJS.Timeout;
+  }>();
 
   constructor(private readonly repo: AppRepository) {}
 
-  connect(socket: WebSocket, _request: IncomingMessage, user: SessionUser, pendingPayloads: string[] = []): void {
+  get retainedGuestResultCount(): number {
+    return this.recentGuestResults.size;
+  }
+
+  connect(socket: WebSocket, _request: IncomingMessage, user: ConnectedUser, pendingPayloads: string[] = []): void {
     const heartbeat = new ConnectionHeartbeat({
       ping: () => {
         if (socket.readyState === WebSocket.OPEN) socket.ping();
@@ -98,8 +112,12 @@ export class GameHub {
     socket.on("message", (payload) => this.receive(client, payload.toString()));
     socket.on("pong", () => heartbeat.acknowledge());
     socket.on("close", () => this.disconnect(client));
-    if (previous) this.replaceConnection(previous, client);
-    else this.recoverConnection(client);
+    if (previous) {
+      this.replaceConnection(previous, client);
+      if (!client.roomId) this.sendRecentGuestResult(client);
+    } else if (!this.recoverConnection(client)) {
+      this.sendRecentGuestResult(client);
+    }
     if (this.clients.get(client.id) === client && socket.readyState === WebSocket.OPEN) {
       heartbeat.start();
     }
@@ -113,6 +131,14 @@ export class GameHub {
     if (this.clients.get(client.id) !== client) return;
     try {
       const event = parseClientEvent(payload);
+      if (isGuest(client.user) && (event.type === "chat.send" || event.type === "tournament.join")) {
+        this.send(client, {
+          type: "error",
+          code: "forbidden",
+          message: "게스트 계정에서는 사용할 수 없는 기능입니다."
+        });
+        return;
+      }
       if (event.type === "queue.join") await this.joinQueue(client, event.mode);
       if (event.type === "queue.leave") this.leaveQueue(client);
       if (event.type === "tournament.join") await this.joinTournamentMatch(client, event.matchId);
@@ -313,8 +339,9 @@ export class GameHub {
   private async matchQueuedClientWithNpc(entry: QueueEntry): Promise<void> {
     const index = this.queue.findIndex((queued) => queued.client.id === entry.client.id);
     if (index < 0 || entry.client.socket.readyState !== WebSocket.OPEN || entry.client.roomId) return;
-    const npc = await this.findClosestNpc(entry.client);
-    if (!npc) return;
+    const guest = isGuest(entry.client.user);
+    const npc = guest ? null : await this.findClosestNpc(entry.client);
+    if (!guest && !npc) return;
     const [queued] = this.queue.splice(index, 1);
     clearQueueTimer(queued);
     this.recordWaitSample(queued.queuedAt);
@@ -371,6 +398,7 @@ export class GameHub {
     let bestDistance = Number.POSITIVE_INFINITY;
     for (let index = 0; index < this.queue.length; index += 1) {
       const candidate = this.queue[index];
+      if (isGuest(candidate.client.user) !== isGuest(client.user)) continue;
       const distance = Math.abs(candidate.client.user.rating - client.user.rating);
       if (distance < bestDistance) {
         bestDistance = distance;
@@ -422,6 +450,7 @@ export class GameHub {
   onlinePlayers(): PublicUser[] {
     const users = new Map<string, PublicUser>();
     for (const client of this.clients.values()) {
+      if (isGuest(client.user)) continue;
       const { email: _email, ...user } = client.user;
       users.set(user.id, { ...user, online: true });
     }
@@ -458,6 +487,7 @@ export class GameHub {
       session,
       reconnectTimer: null,
       disconnectedUsers: {},
+      guest: isGuest(left.user),
       snapshot: {
         roomId,
         tick: 0,
@@ -606,6 +636,21 @@ export class GameHub {
     const rightUser = room.clients.right?.user ?? room.npcUser ?? null;
     const winner = winnerSide === "left" ? leftUser : rightUser;
     const loser = winnerSide === "left" ? rightUser : leftUser;
+    if (room.guest) {
+      const result: GameFinished = {
+        roomId: room.id,
+        matchId: null,
+        persisted: false,
+        winnerSide,
+        leftScore: room.snapshot.state.leftScore,
+        rightScore: room.snapshot.state.rightScore,
+        ratingDelta: 0
+      };
+      this.rememberGuestResult(room, result);
+      this.broadcastRoom(room.id, { type: "game.finished", result });
+      this.removeFinishedRoom(room);
+      return;
+    }
     const finalized = await this.repo.finalizeMatch({
       resultKey: `room:${room.id}:finished`,
       mode: room.mode,
@@ -630,6 +675,39 @@ export class GameHub {
       ratingDelta: 16
     };
     this.broadcastRoom(room.id, { type: "game.finished", result });
+    this.removeFinishedRoom(room);
+  }
+
+  private rememberGuestResult(room: Room, result: GameFinished): void {
+    const expiresAtMs = Date.now() + GUEST_RESULT_RETENTION_MS;
+    for (const client of Object.values(room.clients)) {
+      if (client && isGuest(client.user)) {
+        const userId = client.user.id;
+        const previous = this.recentGuestResults.get(userId);
+        if (previous) clearTimeout(previous.cleanupTimer);
+        const cleanupTimer = setTimeout(() => {
+          const current = this.recentGuestResults.get(userId);
+          if (current?.expiresAtMs === expiresAtMs) this.recentGuestResults.delete(userId);
+        }, GUEST_RESULT_RETENTION_MS);
+        cleanupTimer.unref();
+        this.recentGuestResults.set(userId, { result, expiresAtMs, cleanupTimer });
+      }
+    }
+  }
+
+  private sendRecentGuestResult(client: Client): void {
+    if (!isGuest(client.user)) return;
+    const recent = this.recentGuestResults.get(client.user.id);
+    if (!recent) return;
+    if (Date.now() > recent.expiresAtMs) {
+      clearTimeout(recent.cleanupTimer);
+      this.recentGuestResults.delete(client.user.id);
+      return;
+    }
+    this.send(client, { type: "game.finished", result: recent.result });
+  }
+
+  private removeFinishedRoom(room: Room): void {
     for (const client of Object.values(room.clients)) {
       if (client) client.roomId = null;
     }
@@ -684,6 +762,10 @@ function sideFor(room: Room, client: Client): PlayerSide | null {
   if (room.clients.left?.id === client.id) return "left";
   if (room.clients.right?.id === client.id) return "right";
   return null;
+}
+
+function isGuest(user: ConnectedUser): user is GuestSessionUser {
+  return "sessionKind" in user && user.sessionKind === "guest";
 }
 
 function clearQueueTimer(entry: QueueEntry): void {

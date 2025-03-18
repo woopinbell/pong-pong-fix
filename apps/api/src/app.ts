@@ -6,8 +6,9 @@ import type { AppRepository } from "@pong-pong/db";
 import * as http from "@pong-pong/shared";
 import type { SessionUser } from "@pong-pong/shared";
 import { WebSocket, type RawData } from "ws";
-import { GameHub } from "./gameHub";
+import { GameHub } from "./gameHub.js";
 import {
+  ApiHttpError,
   forbidden,
   installHttpErrorBoundary,
   notFound,
@@ -15,9 +16,15 @@ import {
   parseOutput,
   suspended,
   unauthorized
-} from "./httpBoundary";
-import { createLoggerOptions } from "./requestLogging";
-import { createRawWsTicket, hashWsTicket, WS_TICKET_TTL_SECONDS } from "./wsTicket";
+} from "./httpBoundary.js";
+import {
+  GUEST_SESSION_TTL_SECONDS,
+  GuestAccess,
+  GuestAccessError,
+  type GuestSessionUser
+} from "./guestAccess.js";
+import { createLoggerOptions } from "./requestLogging.js";
+import { createRawWsTicket, hashWsTicket, WS_TICKET_TTL_SECONDS } from "./wsTicket.js";
 
 const WS_POLICY_VIOLATION = 1008;
 const WS_MESSAGE_TOO_BIG = 1009;
@@ -31,11 +38,26 @@ export interface BuildAppOptions {
   repo: AppRepository;
   webOrigin: string;
   appMode?: AppMode;
+  guestAccess?: GuestAccess;
+  sessionSecret?: string;
+  trustProxy?: boolean;
 }
 
-export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppOptions) {
-  const app = Fastify({ logger: createLoggerOptions(process.env.LOG_LEVEL ?? "info") });
+export function buildApp({
+  repo,
+  webOrigin,
+  appMode = readAppMode(),
+  guestAccess,
+  sessionSecret = process.env.SESSION_SECRET ?? "dev-session-secret",
+  trustProxy = false
+}: BuildAppOptions) {
+  const app = Fastify({
+    logger: createLoggerOptions(process.env.LOG_LEVEL ?? "info"),
+    trustProxy
+  });
   const hub = new GameHub(repo);
+  const guests = appMode === "demo" ? guestAccess ?? new GuestAccess({ secret: sessionSecret }) : null;
+  const getCurrentUser = (request: FastifyRequest) => currentUser(repo, request, guests, appMode === "demo");
 
   installHttpErrorBoundary(app);
   app.register(cors, {
@@ -87,7 +109,14 @@ export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppO
         return;
       }
 
-      repo.consumeWsTicket(hashWsTicket(parsedQuery.data.ticket))
+      const ticketHash = hashWsTicket(parsedQuery.data.ticket);
+      const guestUser = guests?.consumeWsTicket(ticketHash) ?? null;
+      const authenticated = guestUser
+        ? Promise.resolve(guestUser)
+        : appMode === "demo"
+          ? Promise.resolve(null)
+          : repo.consumeWsTicket(ticketHash);
+      authenticated
         .then((user) => {
           if (!user) {
             closeAuthentication(WS_POLICY_VIOLATION, "invalid websocket ticket");
@@ -96,6 +125,12 @@ export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppO
           if (authenticationClosed || socket.readyState !== WebSocket.OPEN) {
             return;
           }
+          const lease = isGuestSession(user) ? guests?.acquireConnection(request.ip, user.id) : null;
+          if (isGuestSession(user) && !lease) {
+            closeAuthentication(WS_POLICY_VIOLATION, "guest connection limit exceeded");
+            return;
+          }
+          if (lease) socket.once("close", () => lease.release());
           socket.off("message", bufferPayload);
           hub.connect(socket as WebSocket, request.raw, user, pendingPayloads);
         })
@@ -124,24 +159,65 @@ export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppO
     });
   }
 
+  if (appMode === "demo" && guests) {
+    app.post("/auth/guest", async (request, reply) => {
+      parseInput(http.emptyParamsSchema, request.body ?? {});
+      try {
+        const session = guests.createSession(request.ip);
+        reply.setCookie("pp_guest", session.cookieValue, {
+          path: "/",
+          sameSite: "lax",
+          httpOnly: true,
+          secure: true,
+          maxAge: GUEST_SESSION_TTL_SECONDS
+        });
+        return parseOutput(http.guestAuthResponseSchema, {
+          user: session.user,
+          guest: true,
+          expiresInSeconds: session.expiresInSeconds
+        });
+      } catch (error) {
+        if (error instanceof GuestAccessError) {
+          throw new ApiHttpError(429, error.code, error.message);
+        }
+        throw error;
+      }
+    });
+  }
+
   app.post("/auth/logout", async (request, reply) => {
-    await repo.deleteSession(readSessionToken(request));
+    if (!isGuestSession(await getCurrentUser(request))) {
+      await repo.deleteSession(readSessionToken(request));
+    }
     reply.clearCookie("pp_session", { path: "/" });
+    reply.clearCookie("pp_guest", { path: "/" });
     return parseOutput(http.okResponseSchema, { ok: true });
   });
 
   app.post("/auth/ws-ticket", async (request) => {
     parseInput(http.emptyParamsSchema, request.body ?? {});
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
     if (!isActive(user)) suspended();
 
-    const ticket = createRawWsTicket();
-    await repo.createWsTicket({
-      userId: user.id,
-      ticketHash: hashWsTicket(ticket),
-      ttlSeconds: WS_TICKET_TTL_SECONDS
-    });
+    let ticket: string;
+    try {
+      ticket = isGuestSession(user) && guests
+        ? guests.issueWsTicket(user)
+        : createRawWsTicket();
+    } catch (error) {
+      if (error instanceof GuestAccessError) {
+        throw new ApiHttpError(429, error.code, error.message);
+      }
+      throw error;
+    }
+    if (!isGuestSession(user)) {
+      await repo.createWsTicket({
+        userId: user.id,
+        ticketHash: hashWsTicket(ticket),
+        ttlSeconds: WS_TICKET_TTL_SECONDS
+      });
+    }
     return parseOutput(http.wsTicketResponseSchema, {
       ticket,
       expiresInSeconds: WS_TICKET_TTL_SECONDS,
@@ -150,18 +226,19 @@ export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppO
   });
 
   app.get("/me", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
     return parseOutput(http.userResponseSchema, { user });
   });
 
   app.get("/auth/me", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
     return parseOutput(http.userResponseSchema, { user });
   });
 
   app.get("/users/:id", async (request) => {
+    if (appMode === "demo") notFound("데모 모드에서는 제공하지 않는 기능입니다.");
     const { id } = parseInput(http.idParamsSchema, request.params);
     const user = await repo.getUserById(id);
     if (!user) notFound("사용자를 찾을 수 없습니다.");
@@ -169,19 +246,21 @@ export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppO
   });
 
   app.get("/lobby", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
+    const guest = isGuestSession(user);
     return parseOutput(http.lobbyResponseSchema, {
       me: user,
       onlinePlayers: hub.onlinePlayers(),
-      recentMatches: await repo.listRecentMatches(user?.id),
-      chat: await repo.listLobbyChat(),
+      recentMatches: appMode === "demo" || guest ? [] : await repo.listRecentMatches(user?.id),
+      chat: appMode === "demo" || guest ? [] : await repo.listLobbyChat(),
       stats: hub.liveStats()
     });
   });
 
   app.post("/chat/lobby", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
+    requireRegistered(user);
     if (!isActive(user)) suspended();
     const body = parseInput(http.chatBodySchema, request.body);
     return parseOutput(http.chatResponseSchema, {
@@ -194,17 +273,20 @@ export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppO
     });
   });
 
-  app.get("/leaderboard", async () => parseOutput(http.leaderboardResponseSchema, {
-    entries: await repo.listLeaderboard()
-  }));
+  app.get("/leaderboard", async () => {
+    if (appMode === "demo") notFound("데모 모드에서는 제공하지 않는 기능입니다.");
+    return parseOutput(http.leaderboardResponseSchema, { entries: await repo.listLeaderboard() });
+  });
 
   app.get("/dashboard", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
+    requireRegistered(user);
     return parseOutput(http.dashboardSummarySchema, await repo.getDashboard(user.id));
   });
 
   app.get("/profile/:handle", async (request) => {
+    if (appMode === "demo") notFound("데모 모드에서는 제공하지 않는 기능입니다.");
     const { handle } = parseInput(http.handleParamsSchema, request.params);
     const user = await repo.getUserByHandle(handle);
     if (!user) notFound("프로필을 찾을 수 없습니다.");
@@ -215,14 +297,16 @@ export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppO
   });
 
   app.get("/profile/me", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
+    requireRegistered(user);
     return parseOutput(http.ownProfileResponseSchema, { profile: user });
   });
 
   app.patch("/profile/me", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
+    requireRegistered(user);
     const body = parseInput(http.profileUpdateBodySchema, request.body);
     return parseOutput(http.ownProfileResponseSchema, {
       profile: await repo.updateProfile(user.id, body)
@@ -230,14 +314,16 @@ export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppO
   });
 
   app.get("/friends", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
+    requireRegistered(user);
     return parseOutput(http.friendsResponseSchema, { friends: await repo.listFriends(user.id) });
   });
 
   const requestFriend = async (request: FastifyRequest) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
+    requireRegistered(user);
     if (!isActive(user)) suspended();
     const body = parseInput(http.friendRequestBodySchema, request.body);
     return parseOutput(http.friendResponseSchema, {
@@ -249,19 +335,22 @@ export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppO
   app.post("/friends", requestFriend);
 
   app.post("/friends/:id/accept", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
+    requireRegistered(user);
     const { id } = parseInput(http.idParamsSchema, request.params);
     return parseOutput(http.friendResponseSchema, { friend: await repo.acceptFriend(user.id, id) });
   });
 
-  app.get("/tournaments", async () => parseOutput(http.tournamentsResponseSchema, {
-    tournaments: await repo.listTournaments()
-  }));
+  app.get("/tournaments", async () => {
+    if (appMode === "demo") notFound("데모 모드에서는 제공하지 않는 기능입니다.");
+    return parseOutput(http.tournamentsResponseSchema, { tournaments: await repo.listTournaments() });
+  });
 
   app.post("/tournaments", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
+    requireRegistered(user);
     if (!isActive(user)) suspended();
     const body = parseInput(http.tournamentCreateBodySchema, request.body);
     return parseOutput(http.tournamentResponseSchema, {
@@ -270,40 +359,43 @@ export function buildApp({ repo, webOrigin, appMode = readAppMode() }: BuildAppO
   });
 
   app.post("/tournaments/:id/join", async (request) => {
-    const user = await currentUser(repo, request);
+    const user = await getCurrentUser(request);
     if (!user) unauthorized();
+    requireRegistered(user);
     if (!isActive(user)) suspended();
     const { id } = parseInput(http.idParamsSchema, request.params);
     return parseOutput(http.tournamentResponseSchema, { tournament: await repo.joinTournament(id, user.id) });
   });
 
-  app.get("/admin/users", async (request) => {
-    const user = await requireAdmin(repo, request);
-    return parseOutput(http.adminUsersResponseSchema, { users: await repo.listAdminUsers() });
-  });
-
-  app.get("/admin/actions", async (request) => {
-    await requireAdmin(repo, request);
-    return parseOutput(http.adminActionsResponseSchema, { actions: await repo.listAdminActions() });
-  });
-
-  app.post("/admin/users/:id/ban", async (request) => {
-    const user = await requireAdmin(repo, request);
-    const { id } = parseInput(http.idParamsSchema, request.params);
-    const body = parseInput(http.adminBanBodySchema, request.body ?? {});
-    return parseOutput(http.publicUserResponseSchema, {
-      user: await repo.setUserBan(user.id, id, body.banned ?? true, body.reason ?? "manual review")
+  if (appMode !== "demo") {
+    app.get("/admin/users", async (request) => {
+      const user = await requireAdmin(repo, request);
+      return parseOutput(http.adminUsersResponseSchema, { users: await repo.listAdminUsers() });
     });
-  });
 
-  app.patch("/admin/users/:id/status", async (request) => {
-    const user = await requireAdmin(repo, request);
-    const { id } = parseInput(http.idParamsSchema, request.params);
-    const body = parseInput(http.adminStatusBodySchema, request.body);
-    return parseOutput(http.publicUserResponseSchema, {
-      user: await repo.setUserBan(user.id, id, body.status === "banned", body.reason ?? "manual review")
+    app.get("/admin/actions", async (request) => {
+      await requireAdmin(repo, request);
+      return parseOutput(http.adminActionsResponseSchema, { actions: await repo.listAdminActions() });
     });
-  });
+
+    app.post("/admin/users/:id/ban", async (request) => {
+      const user = await requireAdmin(repo, request);
+      const { id } = parseInput(http.idParamsSchema, request.params);
+      const body = parseInput(http.adminBanBodySchema, request.body ?? {});
+      return parseOutput(http.publicUserResponseSchema, {
+        user: await repo.setUserBan(user.id, id, body.banned ?? true, body.reason ?? "manual review")
+      });
+    });
+
+    app.patch("/admin/users/:id/status", async (request) => {
+      const user = await requireAdmin(repo, request);
+      const { id } = parseInput(http.idParamsSchema, request.params);
+      const body = parseInput(http.adminStatusBodySchema, request.body);
+      return parseOutput(http.publicUserResponseSchema, {
+        user: await repo.setUserBan(user.id, id, body.status === "banned", body.reason ?? "manual review")
+      });
+    });
+  }
 
   return app;
 }
@@ -312,7 +404,14 @@ function readSessionToken(request: FastifyRequest): string | undefined {
   return request.cookies?.pp_session;
 }
 
-async function currentUser(repo: AppRepository, request: FastifyRequest): Promise<SessionUser | null> {
+async function currentUser(
+  repo: AppRepository,
+  request: FastifyRequest,
+  guests: GuestAccess | null = null,
+  guestOnly = false
+): Promise<SessionUser | GuestSessionUser | null> {
+  const guest = guests?.authenticate(request.cookies?.pp_guest, request.ip) ?? null;
+  if (guest || guestOnly) return guest;
   return repo.getSessionUser(readSessionToken(request));
 }
 
@@ -325,6 +424,16 @@ async function requireAdmin(repo: AppRepository, request: FastifyRequest): Promi
 
 function isActive(user: SessionUser): boolean {
   return user.status === "active";
+}
+
+function isGuestSession(user: SessionUser | GuestSessionUser | null): user is GuestSessionUser {
+  return Boolean(user && "sessionKind" in user && user.sessionKind === "guest");
+}
+
+function requireRegistered(user: SessionUser | GuestSessionUser): void {
+  if (isGuestSession(user)) {
+    throw new ApiHttpError(403, "guest_feature_forbidden", "게스트 계정에서는 사용할 수 없는 기능입니다.");
+  }
 }
 
 function readAppMode(input = process.env): AppMode {
