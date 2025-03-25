@@ -31,6 +31,8 @@ pnpm install
 
 비회원 체험은 일반 사용자 데이터와 분리됩니다. 비회원끼리 매칭하고 일정 시간 뒤에는 NPC 상대를 배정하며, 결과를 전적과 순위표에 저장하지 않습니다.
 
+`PongSimulation`이 경기 계산을, `RoomSession`이 방 상태 전이를 맡습니다. 실행 중인 방은 `SharedRoomScheduler`가 하나의 고정 주기로 순회합니다.
+
 ## 실행
 
 Docker Compose로 PostgreSQL, API, 웹과 Caddy를 함께 시작합니다.
