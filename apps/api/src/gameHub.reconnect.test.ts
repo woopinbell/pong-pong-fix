@@ -53,14 +53,17 @@ describe("GameHub connection recovery", () => {
     const roomId = await joinAiMatch(first);
     first.receive({ v: 1, type: "game.ready", roomId });
     await vi.advanceTimersByTimeAsync(100);
+    expect(hub.scheduledRoomCount).toBe(1);
 
     const sequenceBeforeDisconnect = snapshotSequence(first);
     first.terminate();
     await flushEvents();
+    expect(hub.scheduledRoomCount).toBe(0);
     await vi.advanceTimersByTimeAsync(14_999);
 
     const recovered = connect(hub, player("left-user", "왼쪽 사용자"));
     await flushEvents();
+    expect(hub.scheduledRoomCount).toBe(1);
     const snapshot = recovered.latest("game.snapshot");
 
     expect(recovered.latest("queue.matched")).toEqual(
@@ -119,6 +122,7 @@ describe("GameHub connection recovery", () => {
         result: expect.objectContaining({ roomId: matched.roomId, winnerSide: "right" })
       })
     );
+    expect(hub.scheduledRoomCount).toBe(0);
 
     await vi.advanceTimersByTimeAsync(60_000);
     expect(finalizeMatch).toHaveBeenCalledTimes(1);
