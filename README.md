@@ -52,10 +52,13 @@ pnpm typecheck
 pnpm unit
 pnpm postgres-integration
 pnpm build
+pnpm verify:build
 pnpm smoke:http
 pnpm smoke:ws
 pnpm e2e
 ```
 
 `pnpm postgres-integration`은 Testcontainers로 실제 PostgreSQL 경계를 검사합니다.
+
+`pnpm verify:build`는 공용 패키지, DB, API의 `dist`와 Next.js 배포 산출물이 빠짐없이 생성됐는지 확인합니다.
 
