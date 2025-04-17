@@ -33,6 +33,7 @@ type Client = {
   roomId: string | null;
   heartbeat: ConnectionHeartbeat;
   snapshots: LatestSnapshotBuffer;
+  requestId: string | null;
 };
 
 type VersionlessServerEvent = ServerEvent extends infer Event
@@ -71,6 +72,34 @@ const CONNECTION_REPLACED_CLOSE_CODE = 4001;
 const CONNECTION_REPLACED_REASON = "connection replaced";
 const GUEST_RESULT_RETENTION_MS = 2 * 60 * 1_000;
 
+export interface DrainResult {
+  drained: boolean;
+  activeRooms: number;
+}
+
+export interface GameHubObserver {
+  roomCreated?(context: {
+    roomId: string;
+    requestIds: string[];
+    userIds: string[];
+  }): void;
+  reconnect?(context: {
+    outcome: "success" | "expired";
+    roomId: string;
+    requestId?: string;
+    userId?: string;
+  }): void;
+  matchFinalized?(context: {
+    outcome: "success" | "failure";
+    persistence: "database" | "memory";
+    roomId: string;
+    matchId: string | null;
+    userIds: string[];
+  }): void;
+  snapshotDelivered?(delayMs: number): void;
+  snapshotDropped?(reason: "replaced" | "connection_closed" | "congestion"): void;
+}
+
 export class GameHub {
   private readonly clients = new Map<string, Client>();
   private readonly clientsByUser = new Map<string, Client>();
@@ -85,8 +114,17 @@ export class GameHub {
     expiresAtMs: number;
     cleanupTimer: NodeJS.Timeout;
   }>();
+  private acceptingMatches = true;
+  private drainWaiter: {
+    promise: Promise<DrainResult>;
+    resolve: (result: DrainResult) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
 
-  constructor(private readonly repo: AppRepository) {}
+  constructor(
+    private readonly repo: AppRepository,
+    private readonly observer: GameHubObserver = {}
+  ) {}
 
   get retainedGuestResultCount(): number {
     return this.recentGuestResults.size;
@@ -96,7 +134,13 @@ export class GameHub {
     return this.roomScheduler.activeRooms;
   }
 
-  connect(socket: WebSocket, _request: IncomingMessage, user: ConnectedUser, pendingPayloads: string[] = []): void {
+  connect(
+    socket: WebSocket,
+    _request: IncomingMessage,
+    user: ConnectedUser,
+    pendingPayloads: string[] = [],
+    requestId: string | null = null
+  ): void {
     const heartbeat = new ConnectionHeartbeat({
       ping: () => {
         if (socket.readyState === WebSocket.OPEN) socket.ping();
@@ -109,7 +153,11 @@ export class GameHub {
       user,
       roomId: null,
       heartbeat,
-      snapshots: new LatestSnapshotBuffer(socket)
+      snapshots: new LatestSnapshotBuffer(socket, {
+        onDelivered: (delayMs) => this.observer.snapshotDelivered?.(delayMs),
+        onDropped: (reason) => this.observer.snapshotDropped?.(reason)
+      }),
+      requestId
     };
     const previous = this.clientsByUser.get(user.id);
     this.clients.set(client.id, client);
@@ -230,6 +278,12 @@ export class GameHub {
         client.roomId = room.id;
         delete room.disconnectedUsers[side];
         this.sendMatchContext(client, room, side);
+        this.observer.reconnect?.({
+          outcome: "success",
+          roomId: room.id,
+          requestId: client.requestId ?? undefined,
+          userId: client.user.id
+        });
 
         if (room.session.state === "reconnecting") {
           this.send(client, { type: "game.snapshot", snapshot: room.snapshot });
@@ -273,6 +327,10 @@ export class GameHub {
       return;
     }
 
+    for (const userId of Object.values(room.disconnectedUsers)) {
+      if (userId) this.observer.reconnect?.({ outcome: "expired", roomId, userId });
+    }
+
     room.disconnectedUsers = {};
     if (!expiry.winnerSide) {
       this.abandonRoom(room);
@@ -293,6 +351,7 @@ export class GameHub {
       if (client) client.roomId = null;
     }
     this.rooms.delete(room.id);
+    this.notifyDrainProgress();
     this.broadcastPresence();
   }
 
@@ -309,6 +368,10 @@ export class GameHub {
   }
 
   private async joinQueue(client: Client, mode: "queue" | "ai"): Promise<void> {
+    if (!this.acceptingMatches) {
+      this.sendDrainingError(client);
+      return;
+    }
     if (client.roomId) {
       this.send(client, { type: "error", code: "forbidden", message: "이미 진행 중인 경기가 있습니다." });
       return;
@@ -368,6 +431,10 @@ export class GameHub {
   }
 
   private async joinTournamentMatch(client: Client, matchId: string): Promise<void> {
+    if (!this.acceptingMatches) {
+      this.sendDrainingError(client);
+      return;
+    }
     this.leaveQueue(client);
     this.leaveTournamentWaiters(client);
     const match = await this.repo.getTournamentMatch(matchId);
@@ -452,6 +519,54 @@ export class GameHub {
     };
   }
 
+  beginDrain(timeoutMs: number): Promise<DrainResult> {
+    this.acceptingMatches = false;
+    for (const entry of this.queue.splice(0)) {
+      clearQueueTimer(entry);
+      this.sendDrainingError(entry.client);
+    }
+    for (const waiters of this.tournamentWaiters.values()) {
+      for (const client of waiters) this.sendDrainingError(client);
+    }
+    this.tournamentWaiters.clear();
+    this.broadcastPresence();
+
+    if (this.rooms.size === 0) {
+      return Promise.resolve({ drained: true, activeRooms: 0 });
+    }
+    if (this.drainWaiter) return this.drainWaiter.promise;
+
+    let resolveDrain: (result: DrainResult) => void = () => undefined;
+    const promise = new Promise<DrainResult>((resolve) => {
+      resolveDrain = resolve;
+    });
+    const timer = setTimeout(() => {
+      this.finishDrain({ drained: false, activeRooms: this.rooms.size });
+    }, Math.max(0, timeoutMs));
+    timer.unref?.();
+    this.drainWaiter = { promise, resolve: resolveDrain, timer };
+    return promise;
+  }
+
+  close(): void {
+    this.acceptingMatches = false;
+    for (const entry of this.queue.splice(0)) clearQueueTimer(entry);
+    this.tournamentWaiters.clear();
+    this.roomScheduler.stop();
+    for (const room of this.rooms.values()) this.clearReconnectTimer(room);
+    this.rooms.clear();
+    for (const recent of this.recentGuestResults.values()) clearTimeout(recent.cleanupTimer);
+    this.recentGuestResults.clear();
+    const clients = [...this.clients.values()];
+    this.clients.clear();
+    this.clientsByUser.clear();
+    for (const client of clients) {
+      client.heartbeat.stop();
+      client.snapshots.close();
+      if (client.socket.readyState === WebSocket.OPEN) client.socket.terminate();
+    }
+  }
+
   onlinePlayers(): PublicUser[] {
     const users = new Map<string, PublicUser>();
     for (const client of this.clients.values()) {
@@ -524,6 +639,12 @@ export class GameHub {
       }
     };
     this.rooms.set(roomId, room);
+    this.observer.roomCreated?.({
+      roomId,
+      requestIds: [left.requestId, right?.requestId]
+        .filter((requestId): requestId is string => Boolean(requestId)),
+      userIds: [left.user.id, ...(right ? [right.user.id] : [])]
+    });
     left.roomId = roomId;
     if (right) right.roomId = roomId;
     this.send(left, { type: "queue.matched", roomId, side: "left", opponent: rightPlayer?.displayName ?? "연습 AI" });
@@ -645,24 +766,50 @@ export class GameHub {
         rightScore: room.snapshot.state.rightScore,
         ratingDelta: 0
       };
+      this.observer.matchFinalized?.({
+        outcome: "success",
+        persistence: "memory",
+        roomId: room.id,
+        matchId: null,
+        userIds: roomUserIds(room)
+      });
       this.rememberGuestResult(room, result);
       this.broadcastRoom(room.id, { type: "game.finished", result });
       this.removeFinishedRoom(room);
       return;
     }
-    const finalized = await this.repo.finalizeMatch({
-      resultKey: `room:${room.id}:finished`,
-      mode: room.mode,
-      winnerId: winner?.id ?? null,
-      loserId: loser?.id ?? null,
-      scoreLeft: room.snapshot.state.leftScore,
-      scoreRight: room.snapshot.state.rightScore,
-      ...(room.tournamentMatchId ? {
-        tournament: {
-          tournamentMatchId: room.tournamentMatchId,
-          roomId: room.id
-        }
-      } : {})
+    let finalized: Awaited<ReturnType<AppRepository["finalizeMatch"]>>;
+    try {
+      finalized = await this.repo.finalizeMatch({
+        resultKey: `room:${room.id}:finished`,
+        mode: room.mode,
+        winnerId: winner?.id ?? null,
+        loserId: loser?.id ?? null,
+        scoreLeft: room.snapshot.state.leftScore,
+        scoreRight: room.snapshot.state.rightScore,
+        ...(room.tournamentMatchId ? {
+          tournament: {
+            tournamentMatchId: room.tournamentMatchId,
+            roomId: room.id
+          }
+        } : {})
+      });
+    } catch (error) {
+      this.observer.matchFinalized?.({
+        outcome: "failure",
+        persistence: "database",
+        roomId: room.id,
+        matchId: null,
+        userIds: roomUserIds(room)
+      });
+      throw error;
+    }
+    this.observer.matchFinalized?.({
+      outcome: "success",
+      persistence: "database",
+      roomId: room.id,
+      matchId: finalized.matchId,
+      userIds: roomUserIds(room)
     });
     const result: GameFinished = {
       roomId: room.id,
@@ -712,7 +859,30 @@ export class GameHub {
       if (client) client.roomId = null;
     }
     this.rooms.delete(room.id);
+    this.notifyDrainProgress();
     this.broadcastPresence();
+  }
+
+  private sendDrainingError(client: Client): void {
+    this.send(client, {
+      type: "error",
+      code: "server_draining",
+      message: "서버 점검을 준비하고 있어 새 경기를 시작할 수 없습니다."
+    });
+  }
+
+  private notifyDrainProgress(): void {
+    if (this.drainWaiter && this.rooms.size === 0) {
+      this.finishDrain({ drained: true, activeRooms: 0 });
+    }
+  }
+
+  private finishDrain(result: DrainResult): void {
+    const waiter = this.drainWaiter;
+    if (!waiter) return;
+    this.drainWaiter = null;
+    clearTimeout(waiter.timer);
+    waiter.resolve(result);
   }
 
   private broadcastPresence(): void {
@@ -766,6 +936,12 @@ function sideFor(room: Room, client: Client): PlayerSide | null {
 
 function isGuest(user: ConnectedUser): user is GuestSessionUser {
   return "sessionKind" in user && user.sessionKind === "guest";
+}
+
+function roomUserIds(room: Room): string[] {
+  return Object.values(room.clients)
+    .filter((client): client is Client => Boolean(client))
+    .map((client) => client.user.id);
 }
 
 function clearQueueTimer(entry: QueueEntry): void {

@@ -6,7 +6,7 @@ import type { AppRepository } from "@pong-pong/db";
 import * as http from "@pong-pong/shared";
 import type { SessionUser } from "@pong-pong/shared";
 import { WebSocket, type RawData } from "ws";
-import { GameHub } from "./gameHub.js";
+import { GameHub, type DrainResult } from "./gameHub.js";
 import {
   ApiHttpError,
   forbidden,
@@ -26,6 +26,7 @@ import {
 import { createLoggerOptions } from "./requestLogging.js";
 import { readAppMode } from "./env.js";
 import { createRawWsTicket, hashWsTicket, WS_TICKET_TTL_SECONDS } from "./wsTicket.js";
+import { ApiMetrics, instrumentRepository } from "./observability.js";
 
 const WS_POLICY_VIOLATION = 1008;
 const WS_MESSAGE_TOO_BIG = 1009;
@@ -44,8 +45,14 @@ export interface BuildAppOptions {
   trustProxy?: boolean;
 }
 
+declare module "fastify" {
+  interface FastifyInstance {
+    beginDrain(timeoutMs?: number): Promise<DrainResult>;
+  }
+}
+
 export function buildApp({
-  repo,
+  repo: sourceRepo,
   webOrigin,
   appMode = readAppMode(),
   guestAccess,
@@ -56,9 +63,55 @@ export function buildApp({
     logger: createLoggerOptions(process.env.LOG_LEVEL ?? "info"),
     trustProxy
   });
-  const hub = new GameHub(repo);
+  let readGameStats = () => ({ onlinePlayers: 0, queuedPlayers: 0, activeRooms: 0 });
+  const metrics = new ApiMetrics(() => readGameStats());
+  const repo = instrumentRepository(sourceRepo, metrics);
+  const hub = new GameHub(repo, {
+    roomCreated: (context) => {
+      app.log.info(context, "game room created");
+    },
+    reconnect: (context) => {
+      metrics.recordReconnect(context.outcome);
+      app.log.info(context, "game connection recovery recorded");
+    },
+    matchFinalized: (context) => {
+      metrics.recordFinalization(context.persistence, context.outcome);
+      const level = context.outcome === "success" ? "info" : "warn";
+      app.log[level](context, "match finalization recorded");
+    },
+    snapshotDelivered: (delayMs) => {
+      metrics.observeSnapshotDelivery(delayMs);
+    },
+    snapshotDropped: (reason) => {
+      metrics.recordSnapshotDrop(reason);
+    }
+  });
+  readGameStats = () => hub.liveStats();
+  let draining = false;
   const guests = appMode === "demo" ? guestAccess ?? new GuestAccess({ secret: sessionSecret }) : null;
-  const getCurrentUser = (request: FastifyRequest) => currentUser(repo, request, guests, appMode === "demo");
+  const getCurrentUser = async (request: FastifyRequest) => {
+    const user = await currentUser(repo, request, guests, appMode === "demo");
+    if (user) request.log.debug({ userId: user.id }, "request authenticated");
+    return user;
+  };
+
+  app.decorate("beginDrain", async (timeoutMs = 60_000) => {
+    draining = true;
+    return hub.beginDrain(timeoutMs);
+  });
+  app.addHook("onResponse", (request, reply, done) => {
+    metrics.observeRequest(
+      request.method,
+      request.routeOptions.url ?? "unmatched",
+      reply.statusCode,
+      reply.elapsedTime
+    );
+    done();
+  });
+  app.addHook("onClose", async () => {
+    hub.close();
+    metrics.close();
+  });
 
   installHttpErrorBoundary(app);
   app.register(cors, {
@@ -133,7 +186,8 @@ export function buildApp({
           }
           if (lease) socket.once("close", () => lease.release());
           socket.off("message", bufferPayload);
-          hub.connect(socket as WebSocket, request.raw, user, pendingPayloads);
+          request.log.info({ userId: user.id }, "websocket authenticated");
+          hub.connect(socket as WebSocket, request.raw, user, pendingPayloads, String(request.id));
         })
         .catch(() => closeAuthentication(1011, "websocket authentication failed"));
     });
@@ -143,6 +197,50 @@ export function buildApp({
     ok: true,
     service: "pong-pong-api"
   }));
+
+  app.get("/health/live", async () => parseOutput(http.liveHealthResponseSchema, {
+    status: "ok",
+    service: "pong-pong-api"
+  }));
+
+  app.get("/health/ready", async (request, reply) => {
+    const startedAt = performance.now();
+    try {
+      const repository = await repo.checkReadiness();
+      const ready = !draining
+        && repository.database === "up"
+        && (repository.migrations === "current" || repository.migrations === "not_applicable");
+      const body = parseOutput(http.readyHealthResponseSchema, {
+        status: ready ? "ready" : "not_ready",
+        service: "pong-pong-api",
+        checks: {
+          lifecycle: draining ? "draining" : "accepting",
+          database: repository.database,
+          migrations: repository.migrations
+        }
+      });
+      metrics.observeReadiness(body.status, performance.now() - startedAt);
+      return reply.code(ready ? 200 : 503).send(body);
+    } catch (error) {
+      request.log.warn({ errorName: error instanceof Error ? error.name : "UnknownError" }, "readiness check failed");
+      const body = parseOutput(http.readyHealthResponseSchema, {
+        status: "not_ready",
+        service: "pong-pong-api",
+        checks: {
+          lifecycle: draining ? "draining" : "accepting",
+          database: "down",
+          migrations: "unknown"
+        }
+      });
+      metrics.observeReadiness("not_ready", performance.now() - startedAt);
+      return reply.code(503).send(body);
+    }
+  });
+
+  app.get("/metrics", async (_request, reply) => {
+    reply.header("content-type", metrics.contentType);
+    return reply.send(await metrics.scrape());
+  });
 
   if (appMode === "development" || appMode === "test") {
     app.post("/auth/dev-login", async (request, reply) => {
