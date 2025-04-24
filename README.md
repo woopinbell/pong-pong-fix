@@ -66,3 +66,5 @@ pnpm e2e
 
 `/health/live`와 `/health/ready`로 프로세스와 DB 준비 상태를 나누어 확인합니다. `/metrics`는 연결, 방, 이벤트 루프 지연과 경기 결과 확정 상태를 Prometheus 형식으로 제공합니다. 종료 신호를 받으면 새 매칭을 막고 진행 중인 방을 정리한 뒤 서버와 DB 연결을 닫습니다.
 
+부하와 장애 주입 환경은 [실행 안내](tests/load/guide.ko.md)에서 확인할 수 있습니다.
+
