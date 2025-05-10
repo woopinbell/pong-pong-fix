@@ -8,7 +8,7 @@
 
 ```sh
 corepack enable
-pnpm install
+pnpm install --frozen-lockfile
 ```
 
 ## 구성
@@ -35,9 +35,12 @@ pnpm install
 
 ## 실행
 
-Docker Compose로 PostgreSQL, API, 웹과 Caddy를 함께 시작합니다.
+로컬 Compose 환경은 PostgreSQL, 마이그레이션, API, 웹과 Caddy를 순서대로 시작합니다. 세션 비밀 값과 DB 비밀번호는 실행할 때 전달합니다.
 
 ```sh
+POSTGRES_PASSWORD=local-pong-password \
+SESSION_SECRET=local-session-secret-at-least-32-bytes \
+APP_MODE=demo \
 make dev
 ```
 
