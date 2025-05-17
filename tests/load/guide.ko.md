@@ -26,7 +26,8 @@
 `docker-compose.load.yml`을 함께 적용하면 API의 PostgreSQL 연결과 로컬 공개 경로가 `Toxiproxy`를 거칩니다.
 
 ```sh
-SESSION_SECRET=local-load-secret APP_MODE=development \
+POSTGRES_PASSWORD=local-load-password \
+SESSION_SECRET=local-load-session-secret-32-bytes APP_MODE=development \
   docker compose -f docker-compose.yml -f docker-compose.load.yml up --build
 ```
 
@@ -92,7 +93,8 @@ node tests/load/toxiproxy-control.mjs edge-up
 fnm exec --using=24.18.0 node --test tests/load/load-harness.test.mjs
 k6 inspect tests/load/pong-load.js
 fnm exec --using=24.18.0 node tests/load/toxiproxy-control.mjs plan
-SESSION_SECRET=static-validation APP_MODE=development \
+POSTGRES_PASSWORD=static-validation-password \
+SESSION_SECRET=static-validation-session-secret APP_MODE=development \
   docker compose -f docker-compose.yml -f docker-compose.load.yml config
 ```
 
