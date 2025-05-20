@@ -1,7 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
-import type { AppRepository } from "@pong-pong/db";
+import type { AppRepository, MatchResultRepository } from "@pong-pong/db";
 import {
   encodeServerEvent,
   parseClientEvent,
@@ -18,6 +18,7 @@ import { DEFAULT_TIMESTEP_MS } from "./game/fixedStepScheduler.js";
 import { ConnectionHeartbeat } from "./game/heartbeat.js";
 import { InputGate } from "./game/inputGate.js";
 import { HARD_BUFFERED_AMOUNT_BYTES, LatestSnapshotBuffer } from "./game/latestSnapshotBuffer.js";
+import { Matchmaker, type MatchmakingPlayer } from "./game/matchmaker.js";
 import { PongAi } from "./game/pongAi.js";
 import { PongSimulation, type PongSimulationState } from "./game/pongSimulation.js";
 import { RoomSession } from "./game/roomSession.js";
@@ -44,9 +45,17 @@ type VersionlessServerEvent = ServerEvent extends infer Event
 
 type QueueEntry = {
   client: Client;
-  queuedAt: number;
+  queuedAtMs: number;
   npcFallbackTimer: NodeJS.Timeout | null;
 };
+
+type GameHubRepository = Pick<
+  AppRepository,
+  | "createChatMessage"
+  | "getTournamentMatch"
+  | "listNpcOpponents"
+  | "startTournamentMatch"
+> & MatchResultRepository;
 
 type Room = {
   id: string;
@@ -66,7 +75,7 @@ type Room = {
   guest: boolean;
 };
 
-const NPC_QUEUE_FALLBACK_MS = 6000;
+const MAX_MATCHMAKING_RATING_DIFFERENCE = 200;
 const SIMULATION_TIMESTEP_MS = DEFAULT_TIMESTEP_MS;
 const CONNECTION_REPLACED_CLOSE_CODE = 4001;
 const CONNECTION_REPLACED_REASON = "connection replaced";
@@ -103,7 +112,11 @@ export interface GameHubObserver {
 export class GameHub {
   private readonly clients = new Map<string, Client>();
   private readonly clientsByUser = new Map<string, Client>();
-  private readonly queue: QueueEntry[] = [];
+  private readonly queueEntries = new Map<string, QueueEntry>();
+  private readonly matchmaker = new Matchmaker({
+    clock: () => Date.now(),
+    maxRatingDifference: MAX_MATCHMAKING_RATING_DIFFERENCE
+  });
   private readonly rooms = new Map<string, Room>();
   private readonly tournamentWaiters = new Map<string, Client[]>();
   private readonly waitSamples: number[] = [];
@@ -122,7 +135,7 @@ export class GameHub {
   } | null = null;
 
   constructor(
-    private readonly repo: AppRepository,
+    private readonly repo: GameHubRepository,
     private readonly observer: GameHubObserver = {}
   ) {}
 
@@ -347,6 +360,7 @@ export class GameHub {
   private abandonRoom(room: Room): void {
     this.roomScheduler.unregister(room.id);
     this.clearReconnectTimer(room);
+    this.releaseMatchmakingReservations(room);
     for (const client of Object.values(room.clients)) {
       if (client) client.roomId = null;
     }
@@ -376,44 +390,108 @@ export class GameHub {
       this.send(client, { type: "error", code: "forbidden", message: "이미 진행 중인 경기가 있습니다." });
       return;
     }
-    this.leaveQueue(client);
     this.pruneQueue();
     if (mode === "ai") {
+      this.leaveQueue(client);
       this.createRoom(client, null, { ai: true, mode: "ai" });
       return;
     }
-    const opponentIndex = this.findClosestQueuedOpponent(client);
-    if (opponentIndex < 0) {
-      const entry: QueueEntry = { client, queuedAt: Date.now(), npcFallbackTimer: null };
-      entry.npcFallbackTimer = setTimeout(() => {
-        this.matchQueuedClientWithNpc(entry).catch((error) => {
-          this.send(client, {
-            type: "error",
-            code: "internal_error",
-            message: error instanceof Error ? error.message : "AI 상대를 찾지 못했습니다."
-          });
-        });
-      }, NPC_QUEUE_FALLBACK_MS);
-      this.queue.push(entry);
+
+    const join = this.matchmaker.enqueue(matchmakingPlayer(client));
+    if (join.type === "duplicate") {
+      this.send(client, {
+        type: "error",
+        code: "forbidden",
+        message: join.status === "queued" ? "이미 대기열에 참가했습니다." : "이미 경기가 배정되었습니다."
+      });
+      return;
+    }
+    if (join.type === "queued") {
+      const entry: QueueEntry = {
+        client,
+        queuedAtMs: join.queuedAtMs,
+        npcFallbackTimer: null
+      };
+      this.queueEntries.set(client.user.id, entry);
+      this.armAiFallback(entry, join.aiFallbackAtMs - Date.now());
       this.broadcastPresence();
       return;
     }
-    const [opponent] = this.queue.splice(opponentIndex, 1);
+
+    const opponent = this.queueEntries.get(join.match.left.userId);
+    if (!opponent) {
+      this.matchmaker.release(join.match.left.userId);
+      this.matchmaker.release(join.match.right.userId);
+      throw new Error("대기 중인 상대 연결을 찾지 못했습니다.");
+    }
+    this.queueEntries.delete(opponent.client.user.id);
     clearQueueTimer(opponent);
-    this.recordWaitSample(opponent.queuedAt);
-    this.createRoom(opponent.client, client, { ai: false, mode: "queue" });
+    this.recordWaitSample(opponent.queuedAtMs);
+    try {
+      this.createRoom(opponent.client, client, { ai: false, mode: "queue" });
+    } catch (error) {
+      this.matchmaker.release(opponent.client.user.id);
+      this.matchmaker.release(client.user.id);
+      throw error;
+    }
+  }
+
+  private armAiFallback(entry: QueueEntry, delayMs: number): void {
+    clearQueueTimer(entry);
+    entry.npcFallbackTimer = setTimeout(() => {
+      this.matchQueuedClientWithNpc(entry).catch((error) => {
+        this.send(entry.client, {
+          type: "error",
+          code: "internal_error",
+          message: error instanceof Error ? error.message : "AI 상대를 찾지 못했습니다."
+        });
+      });
+    }, Math.max(0, delayMs));
   }
 
   private async matchQueuedClientWithNpc(entry: QueueEntry): Promise<void> {
-    const index = this.queue.findIndex((queued) => queued.client.id === entry.client.id);
-    if (index < 0 || entry.client.socket.readyState !== WebSocket.OPEN || entry.client.roomId) return;
+    if (this.queueEntries.get(entry.client.user.id) !== entry) return;
+    if (entry.client.socket.readyState !== WebSocket.OPEN || entry.client.roomId) {
+      this.leaveQueue(entry.client);
+      return;
+    }
+    const fallback = this.matchmaker.claimAiFallback(entry.client.user.id);
+    if (fallback.type === "waiting") {
+      this.armAiFallback(entry, fallback.remainingMs);
+      return;
+    }
+    if (fallback.type === "unavailable") {
+      this.queueEntries.delete(entry.client.user.id);
+      clearQueueTimer(entry);
+      return;
+    }
+    clearQueueTimer(entry);
     const guest = isGuest(entry.client.user);
-    const npc = guest ? null : await this.findClosestNpc(entry.client);
-    if (!guest && !npc) return;
-    const [queued] = this.queue.splice(index, 1);
-    clearQueueTimer(queued);
-    this.recordWaitSample(queued.queuedAt);
-    this.createRoom(queued.client, null, { ai: true, mode: "queue", npc });
+    try {
+      const npc = guest ? null : await this.findClosestNpc(entry.client);
+      if (
+        this.queueEntries.get(entry.client.user.id) !== entry ||
+        !this.acceptingMatches ||
+        entry.client.socket.readyState !== WebSocket.OPEN ||
+        entry.client.roomId
+      ) {
+        this.matchmaker.release(entry.client.user.id);
+        return;
+      }
+      this.queueEntries.delete(entry.client.user.id);
+      if (!guest && !npc) {
+        this.matchmaker.release(entry.client.user.id);
+        throw new Error("AI 상대를 찾지 못했습니다.");
+      }
+      this.recordWaitSample(entry.queuedAtMs);
+      this.createRoom(entry.client, null, { ai: true, mode: "queue", npc });
+    } catch (error) {
+      if (this.queueEntries.get(entry.client.user.id) === entry) {
+        this.queueEntries.delete(entry.client.user.id);
+      }
+      this.matchmaker.release(entry.client.user.id);
+      throw error;
+    }
   }
 
   private async findClosestNpc(client: Client): Promise<PublicUser | null> {
@@ -465,27 +543,13 @@ export class GameHub {
     await this.repo.startTournamentMatch(matchId, roomId);
   }
 
-  private findClosestQueuedOpponent(client: Client): number {
-    let bestIndex = -1;
-    let bestDistance = Number.POSITIVE_INFINITY;
-    for (let index = 0; index < this.queue.length; index += 1) {
-      const candidate = this.queue[index];
-      if (isGuest(candidate.client.user) !== isGuest(client.user)) continue;
-      const distance = Math.abs(candidate.client.user.rating - client.user.rating);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestIndex = index;
-      }
-    }
-    return bestIndex;
-  }
-
   private leaveQueue(client: Client): void {
-    const index = this.queue.findIndex((queued) => queued.client.id === client.id);
-    if (index >= 0) {
-      const [entry] = this.queue.splice(index, 1);
-      clearQueueTimer(entry);
-    }
+    const entry = this.queueEntries.get(client.user.id);
+    const leftQueue = this.matchmaker.leaveQueue(client.user.id);
+    if (!entry) return;
+    if (!leftQueue) this.matchmaker.release(client.user.id);
+    this.queueEntries.delete(client.user.id);
+    clearQueueTimer(entry);
   }
 
   private leaveTournamentWaiters(client: Client): void {
@@ -497,11 +561,8 @@ export class GameHub {
   }
 
   private pruneQueue(): void {
-    for (let index = this.queue.length - 1; index >= 0; index -= 1) {
-      if (this.queue[index].client.socket.readyState !== WebSocket.OPEN) {
-        const [entry] = this.queue.splice(index, 1);
-        clearQueueTimer(entry);
-      }
+    for (const entry of this.queueEntries.values()) {
+      if (entry.client.socket.readyState !== WebSocket.OPEN) this.leaveQueue(entry.client);
     }
   }
 
@@ -513,7 +574,7 @@ export class GameHub {
     return {
       onlinePlayers: this.clients.size,
       playingPlayers,
-      queuedPlayers: this.queue.length,
+      queuedPlayers: this.matchmaker.queuedCount,
       activeRooms: this.rooms.size,
       averageWaitSeconds
     };
@@ -521,8 +582,8 @@ export class GameHub {
 
   beginDrain(timeoutMs: number): Promise<DrainResult> {
     this.acceptingMatches = false;
-    for (const entry of this.queue.splice(0)) {
-      clearQueueTimer(entry);
+    for (const entry of [...this.queueEntries.values()]) {
+      this.leaveQueue(entry.client);
       this.sendDrainingError(entry.client);
     }
     for (const waiters of this.tournamentWaiters.values()) {
@@ -550,10 +611,13 @@ export class GameHub {
 
   close(): void {
     this.acceptingMatches = false;
-    for (const entry of this.queue.splice(0)) clearQueueTimer(entry);
+    for (const entry of [...this.queueEntries.values()]) this.leaveQueue(entry.client);
     this.tournamentWaiters.clear();
     this.roomScheduler.stop();
-    for (const room of this.rooms.values()) this.clearReconnectTimer(room);
+    for (const room of this.rooms.values()) {
+      this.clearReconnectTimer(room);
+      this.releaseMatchmakingReservations(room);
+    }
     this.rooms.clear();
     for (const recent of this.recentGuestResults.values()) clearTimeout(recent.cleanupTimer);
     this.recentGuestResults.clear();
@@ -638,20 +702,31 @@ export class GameHub {
         }
       }
     };
-    this.rooms.set(roomId, room);
-    this.observer.roomCreated?.({
-      roomId,
-      requestIds: [left.requestId, right?.requestId]
-        .filter((requestId): requestId is string => Boolean(requestId)),
-      userIds: [left.user.id, ...(right ? [right.user.id] : [])]
-    });
-    left.roomId = roomId;
-    if (right) right.roomId = roomId;
-    this.send(left, { type: "queue.matched", roomId, side: "left", opponent: rightPlayer?.displayName ?? "연습 AI" });
-    if (right) this.send(right, { type: "queue.matched", roomId, side: "right", opponent: left.user.displayName });
-    this.broadcastSnapshot(room);
-    this.broadcastPresence();
-    return roomId;
+    try {
+      this.rooms.set(roomId, room);
+      this.observer.roomCreated?.({
+        roomId,
+        requestIds: [left.requestId, right?.requestId]
+          .filter((requestId): requestId is string => Boolean(requestId)),
+        userIds: [left.user.id, ...(right ? [right.user.id] : [])]
+      });
+      left.roomId = roomId;
+      if (right) right.roomId = roomId;
+      this.send(left, { type: "queue.matched", roomId, side: "left", opponent: rightPlayer?.displayName ?? "연습 AI" });
+      if (right) this.send(right, { type: "queue.matched", roomId, side: "right", opponent: left.user.displayName });
+      this.broadcastSnapshot(room);
+      this.broadcastPresence();
+      return roomId;
+    } catch (error) {
+      this.roomScheduler.unregister(roomId);
+      this.clearReconnectTimer(room);
+      this.rooms.delete(roomId);
+      if (left.roomId === roomId) left.roomId = null;
+      if (right?.roomId === roomId) right.roomId = null;
+      this.notifyDrainProgress();
+      this.broadcastPresence();
+      throw error;
+    }
   }
 
   private markReady(client: Client, roomId: string): void {
@@ -766,19 +841,22 @@ export class GameHub {
         rightScore: room.snapshot.state.rightScore,
         ratingDelta: 0
       };
-      this.observer.matchFinalized?.({
-        outcome: "success",
-        persistence: "memory",
-        roomId: room.id,
-        matchId: null,
-        userIds: roomUserIds(room)
-      });
-      this.rememberGuestResult(room, result);
-      this.broadcastRoom(room.id, { type: "game.finished", result });
-      this.removeFinishedRoom(room);
+      try {
+        this.observer.matchFinalized?.({
+          outcome: "success",
+          persistence: "memory",
+          roomId: room.id,
+          matchId: null,
+          userIds: roomUserIds(room)
+        });
+        this.rememberGuestResult(room, result);
+        this.broadcastRoom(room.id, { type: "game.finished", result });
+      } finally {
+        this.removeFinishedRoom(room);
+      }
       return;
     }
-    let finalized: Awaited<ReturnType<AppRepository["finalizeMatch"]>>;
+    let finalized: Awaited<ReturnType<MatchResultRepository["finalizeMatch"]>>;
     try {
       finalized = await this.repo.finalizeMatch({
         resultKey: `room:${room.id}:finished`,
@@ -795,6 +873,7 @@ export class GameHub {
         } : {})
       });
     } catch (error) {
+      this.releaseMatchmakingReservations(room);
       this.observer.matchFinalized?.({
         outcome: "failure",
         persistence: "database",
@@ -804,24 +883,27 @@ export class GameHub {
       });
       throw error;
     }
-    this.observer.matchFinalized?.({
-      outcome: "success",
-      persistence: "database",
-      roomId: room.id,
-      matchId: finalized.matchId,
-      userIds: roomUserIds(room)
-    });
-    const result: GameFinished = {
-      roomId: room.id,
-      matchId: finalized.matchId,
-      persisted: true,
-      winnerSide,
-      leftScore: room.snapshot.state.leftScore,
-      rightScore: room.snapshot.state.rightScore,
-      ratingDelta: 16
-    };
-    this.broadcastRoom(room.id, { type: "game.finished", result });
-    this.removeFinishedRoom(room);
+    try {
+      this.observer.matchFinalized?.({
+        outcome: "success",
+        persistence: "database",
+        roomId: room.id,
+        matchId: finalized.matchId,
+        userIds: roomUserIds(room)
+      });
+      const result: GameFinished = {
+        roomId: room.id,
+        matchId: finalized.matchId,
+        persisted: true,
+        winnerSide,
+        leftScore: room.snapshot.state.leftScore,
+        rightScore: room.snapshot.state.rightScore,
+        ratingDelta: 16
+      };
+      this.broadcastRoom(room.id, { type: "game.finished", result });
+    } finally {
+      this.removeFinishedRoom(room);
+    }
   }
 
   private rememberGuestResult(room: Room, result: GameFinished): void {
@@ -855,12 +937,19 @@ export class GameHub {
 
   private removeFinishedRoom(room: Room): void {
     this.roomScheduler.unregister(room.id);
+    this.releaseMatchmakingReservations(room);
     for (const client of Object.values(room.clients)) {
       if (client) client.roomId = null;
     }
     this.rooms.delete(room.id);
     this.notifyDrainProgress();
     this.broadcastPresence();
+  }
+
+  private releaseMatchmakingReservations(room: Room): void {
+    for (const client of Object.values(room.clients)) {
+      if (client) this.matchmaker.release(client.user.id);
+    }
   }
 
   private sendDrainingError(client: Client): void {
@@ -936,6 +1025,14 @@ function sideFor(room: Room, client: Client): PlayerSide | null {
 
 function isGuest(user: ConnectedUser): user is GuestSessionUser {
   return "sessionKind" in user && user.sessionKind === "guest";
+}
+
+function matchmakingPlayer(client: Client): MatchmakingPlayer {
+  return {
+    userId: client.user.id,
+    rating: client.user.rating,
+    kind: isGuest(client.user) ? "guest" : "registered"
+  };
 }
 
 function roomUserIds(room: Room): string[] {
