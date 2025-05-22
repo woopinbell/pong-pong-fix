@@ -98,6 +98,47 @@ describe("PostgreSQL integration", () => {
     }, { migrate: false });
   });
 
+  it("expires legacy sessions without changing users or match history", async () => {
+    await withIsolatedDatabase(async ({ databaseUrl, openPool, openRepository }) => {
+      const migrateTo = migrateDatabase as (
+        connectionString: string,
+        targetMigration?: string
+      ) => Promise<void>;
+      await migrateTo(databaseUrl, "004_friendship_tournament_invariants");
+
+      const repository = openRepository();
+      const pool = openPool();
+      const winner = await repository.upsertDevUser({
+        handle: "auth-migration-winner",
+        displayName: "Auth Migration Winner"
+      });
+      const loser = await repository.upsertDevUser({
+        handle: "auth-migration-loser",
+        displayName: "Auth Migration Loser"
+      });
+      const sessionToken = await repository.createSession(winner.id);
+      await repository.finalizeMatch({
+        resultKey: "room:auth-migration:finished",
+        mode: "queue",
+        winnerId: winner.id,
+        loserId: loser.id,
+        scoreLeft: 3,
+        scoreRight: 1
+      });
+      const before = await authMigrationSnapshot(pool);
+      await expect(repository.getSessionUser(sessionToken)).resolves.toMatchObject({ id: winner.id });
+
+      await migrateDatabase(databaseUrl);
+
+      await expect(repository.getSessionUser(sessionToken)).resolves.toBeNull();
+      expect(await authMigrationSnapshot(pool)).toEqual(before);
+      await expect(pool.query<{ count: number }>(
+        "select count(*)::integer as count from sessions"
+      )).resolves.toMatchObject({ rows: [{ count: 0 }] });
+      expect(await appliedMigrations(pool)).toContain("005_expire_legacy_sessions");
+    }, { migrate: false });
+  });
+
   it("keeps the demo seed limited to NPC accounts", async () => {
     await withIsolatedDatabase(async ({ openPool, openRepository }) => {
       const repository = openRepository();
@@ -697,6 +738,19 @@ async function tableNames(pool: Pool, schema: string): Promise<string[]> {
     [schema]
   );
   return result.rows.map((row) => row.tablename);
+}
+
+async function authMigrationSnapshot(pool: Pool) {
+  const [users, matches, ratingHistory] = await Promise.all([
+    pool.query("select id, handle, rating, wins, losses from users order by handle"),
+    pool.query("select id, result_key, winner_id, loser_id, score_left, score_right from matches order by id"),
+    pool.query("select match_id, user_id, rating_before, rating_after, delta from rating_history order by user_id")
+  ]);
+  return {
+    users: users.rows,
+    matches: matches.rows,
+    ratingHistory: ratingHistory.rows
+  };
 }
 
 async function appliedMigrations(pool: Pool): Promise<string[]> {
