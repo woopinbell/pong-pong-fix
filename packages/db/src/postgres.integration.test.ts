@@ -88,7 +88,8 @@ describe("PostgreSQL integration", () => {
         "001_initial",
         "002_ws_tickets",
         "003_match_finalization",
-        "004_friendship_tournament_invariants"
+        "004_friendship_tournament_invariants",
+        "005_expire_legacy_sessions"
       ]);
 
       await migrateDatabase(databaseUrl);
@@ -100,11 +101,7 @@ describe("PostgreSQL integration", () => {
 
   it("expires legacy sessions without changing users or match history", async () => {
     await withIsolatedDatabase(async ({ databaseUrl, openPool, openRepository }) => {
-      const migrateTo = migrateDatabase as (
-        connectionString: string,
-        targetMigration?: string
-      ) => Promise<void>;
-      await migrateTo(databaseUrl, "004_friendship_tournament_invariants");
+      await migrateDatabase(databaseUrl, "004_friendship_tournament_invariants");
 
       const repository = openRepository();
       const pool = openPool();
