@@ -83,6 +83,7 @@ describe("health and metrics routes", () => {
     expect(response.body).toContain("pong_pong_api_database_operation_duration_seconds");
     expect(response.body).toContain("pong_pong_api_snapshot_delivery_delay_seconds");
     expect(response.body).toContain("pong_pong_api_snapshot_drops_total");
+    expect(response.body).toContain("pong_pong_api_event_loop_lag_p95_seconds");
     expect(response.body).toMatch(/route="\/health\/live"/);
     expect(response.body).not.toContain("requestId");
     expect(response.body).not.toContain("userId");
