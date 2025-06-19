@@ -59,11 +59,14 @@ pnpm verify:build
 pnpm smoke:http
 pnpm smoke:ws
 pnpm e2e
+pnpm e2e:guest-demo
 ```
 
 `pnpm postgres-integration`은 Testcontainers로 실제 PostgreSQL 경계를 검사합니다.
 
 `pnpm verify:build`는 공용 패키지, DB, API의 `dist`와 Next.js 배포 산출물이 빠짐없이 생성됐는지 확인합니다.
+
+`pnpm e2e:guest-demo`는 비회원 PvP, NPC 전환과 재접속을 독립된 브라우저 흐름으로 검사합니다.
 
 ## 운영 상태
 
