@@ -33,6 +33,8 @@ pnpm install --frozen-lockfile
 
 `PongSimulation`이 경기 계산을, `RoomSession`이 방 상태 전이를 맡습니다. 실행 중인 방은 `SharedRoomScheduler`가 하나의 고정 주기로 순회합니다.
 
+대시보드에서 경기 기록과 레이팅 변화를 확인할 수 있으며, 공개 프로필 조회와 친구 추가·삭제도 지원합니다.
+
 ## 실행
 
 로컬 Compose 환경은 PostgreSQL, 마이그레이션, API, 웹과 Caddy를 순서대로 시작합니다. 세션 비밀 값과 DB 비밀번호는 실행할 때 전달합니다.
