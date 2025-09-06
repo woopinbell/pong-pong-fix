@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { apiErrorBodySchema } from "@pong-pong/shared";
+import { apiErrorBodySchema, jsonHttpRequestContracts } from "@pong-pong/shared";
 import { createMemoryRepository, type AppRepository } from "@pong-pong/db";
 import { buildApp } from "./app";
 
@@ -114,14 +114,9 @@ describe("JSON HTTP request contracts", () => {
     }
   );
 
-  it("applies the empty body contract to a JSON GET route", async () => {
-    const response = await app.inject({
-      method: "GET",
-      url: "/leaderboard",
-      payload: { unexpected: true }
-    });
-
-    expectValidationError(response);
+  it("keeps an explicit strict body contract for a bodyless JSON GET route", () => {
+    expect(jsonHttpRequestContracts.leaderboard.body.safeParse({ unexpected: true }).success)
+      .toBe(false);
   });
 
   it.each([
