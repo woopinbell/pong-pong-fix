@@ -2,6 +2,16 @@
 
 API와 웹이 주고받는 공개 형식은 `packages/shared/src/http.ts`, `packages/shared/src/ws.ts`, `packages/shared/src/game.ts`가 기준입니다. 서버 안에서만 쓰는 객체를 응답에 바로 직렬화하지 않고, 송수신 지점에서 Zod 스키마로 확인합니다.
 
+## HTTP 요청 검사
+
+JSON을 반환하는 라우트는 경로 매개변수, 쿼리, 본문을 한 묶음으로 검사합니다. 값이 없는 자리에도 빈 객체만 허용하는 엄격한 스키마를 둡니다. 따라서 `/auth/logout`에 본문을 붙이거나 `/leaderboard?unexpected=1`처럼 정의하지 않은 쿼리를 보내면 라우트 로직을 실행하기 전에 `validation_error`로 응답합니다. 상태 확인 라우트에도 같은 규칙을 적용합니다.
+
+JSON 형식을 쓰지 않는 응답과 연결은 따로 다룹니다.
+
+- `/metrics` 응답은 Prometheus 텍스트 형식입니다. 콘텐츠 유형과 주요 메트릭 이름은 상태 확인 테스트에서 검증합니다.
+- `/ws`는 HTTP 응답 라우트가 아니라 WebSocket 업그레이드 경로입니다. 쿼리는 공용 `wsHandshakeQuerySchema`로 검사하고, 이후 프레임은 WebSocket 이벤트 스키마로 확인합니다.
+- 현재 OAuth 콜백 라우트는 없습니다. 나중에 추가한다면 공급자가 보낸 쿼리를 그대로 통과시키지 않고 콜백 전용 엄격한 스키마를 공용 패키지에 먼저 정의해야 합니다.
+
 ## HTTP 오류와 인증
 
 HTTP 오류 본문은 다음 모양으로 고정합니다.
@@ -10,7 +20,7 @@ HTTP 오류 본문은 다음 모양으로 고정합니다.
 {
   "error": {
     "code": "validation_error",
-    "message": "요청 값을 확인해주세요.",
+    "message": "입력값을 확인해주세요.",
     "requestId": "req-1",
     "fieldErrors": {
       "displayName": ["값이 너무 깁니다."]

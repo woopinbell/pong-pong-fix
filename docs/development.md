@@ -41,12 +41,14 @@ pnpm verify:build
 pnpm smoke:http
 pnpm smoke:ws
 pnpm e2e
+pnpm e2e:guest-demo
 ```
 
 - `pnpm unit`은 공용 계약, API 로직, 웹 컴포넌트와 상태 전이 함수, 메모리 저장소를 검사합니다.
 - `pnpm postgres-integration`은 Testcontainers가 띄운 임의 포트 PostgreSQL을 사용합니다. 테스트별 스키마를 만들고 마이그레이션, 테스트 데이터, 정리를 분리합니다.
 - `pnpm smoke:http`와 `pnpm smoke:ws`는 빌드한 프로세스를 직접 실행해 HTTP와 WebSocket 통신을 확인합니다.
 - `pnpm e2e`는 브라우저에서 로그인, 로비, 경기 흐름을 확인합니다.
+- `pnpm e2e:guest-demo`는 `APP_MODE=demo`로 띄운 API와 데모 설정으로 빌드한 웹을 대상으로 비회원 진입, PvP, AI 대체 상대, 재접속을 확인합니다. 일반 E2E와 실행 환경이 달라 CI에서도 별도 작업으로 실행합니다.
 - `pnpm verify:build`는 공용 패키지, DB, API의 `dist`와 Next.js 독립 실행 산출물이 실제로 생겼는지 검사합니다.
 
 PostgreSQL 통합 검사는 Docker 데몬을 사용합니다. 테스트가 중간에 실패해도 스키마, 연결 풀, 컨테이너를 `finally`에서 정리하도록 작성되어 있습니다. 로컬 Docker를 쓸 수 없는 환경에서는 이 검사를 건너뛴 것으로 성공 처리하지 말고, 실행하지 못한 이유를 결과에 남깁니다.
