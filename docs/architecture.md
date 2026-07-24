@@ -32,7 +32,7 @@ flowchart LR
     result --> database[("PostgreSQL")]
 ```
 
-`FixedStepAccumulator`는 `performance.now()`를 기준으로 경과 시간을 누적합니다. 한 번의 루프에서 최대 5틱만 따라잡고, 누적 지연은 250ms에서 잘라 장시간 정지 뒤에 계산이 한꺼번에 몰리지 않도록 합니다. 스케줄러 비교는 `tests/load/scheduler-benchmark.mjs`로 다시 실행할 수 있으며, 기록된 결과는 `docs/measurements/scheduler-2026-07-23.json`에 있습니다.
+`FixedStepAccumulator`는 `performance.now()`를 기준으로 경과 시간을 누적합니다. 한 번의 루프에서 최대 5틱만 따라잡고, 누적 지연은 250ms에서 잘라 장시간 정지 뒤에 계산이 한꺼번에 몰리지 않도록 합니다. 스케줄러 비교는 `tests/load/scheduler-benchmark.mjs`로 다시 실행할 수 있으며, 기록된 결과는 `docs/measurements/scheduler-2026-07-24.json`에 있습니다.
 
 ## 방 상태
 

@@ -1,0 +1,35 @@
+{
+  "recordedAt": "2026-07-24T12:12:27.695Z",
+  "testedTree": "516ca98186b5ccd7fbfa7b513c9ca69e05d5332b",
+  "runtime": {
+    "node": "v24.18.0",
+    "platform": "darwin 25.5.0",
+    "cpu": "Apple M1",
+    "cpuCount": 8,
+    "totalMemoryBytes": 17179869184,
+    "freeMemoryBytesAtStart": 125190144
+  },
+  "settings": {
+    "timestepMs": 50,
+    "durationMs": 1500,
+    "warmupMs": 250,
+    "repeats": 5,
+    "roomCounts": [1, 20, 50, 100]
+  },
+  "measurements": [
+    { "strategy": "room", "roomCount": 1, "sampleCount": 125, "p95LagMs": 28.554, "p99LagMs": 29.63 },
+    { "strategy": "shared", "roomCount": 1, "sampleCount": 125, "p95LagMs": 29.174, "p99LagMs": 29.5 },
+    { "strategy": "room", "roomCount": 20, "sampleCount": 2500, "p95LagMs": 28.597, "p99LagMs": 29.053 },
+    { "strategy": "shared", "roomCount": 20, "sampleCount": 2500, "p95LagMs": 28.102, "p99LagMs": 29.179 },
+    { "strategy": "room", "roomCount": 50, "sampleCount": 6200, "p95LagMs": 30.674, "p99LagMs": 31.909 },
+    { "strategy": "shared", "roomCount": 50, "sampleCount": 6250, "p95LagMs": 27.82, "p99LagMs": 29.268 },
+    { "strategy": "room", "roomCount": 100, "sampleCount": 12399, "p95LagMs": 29.867, "p99LagMs": 31.203 },
+    { "strategy": "shared", "roomCount": 100, "sampleCount": 12500, "p95LagMs": 30.788, "p99LagMs": 31.792 }
+  ],
+  "decision": {
+    "selectedStrategy": "shared",
+    "room50P95LagMs": 30.674,
+    "shared50P95LagMs": 27.82,
+    "maximumSharedP95LagMs": 32.208
+  }
+}
