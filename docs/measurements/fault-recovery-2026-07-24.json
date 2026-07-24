@@ -1,0 +1,32 @@
+{
+  "startedAt": "2026-07-24T12:10:57.688Z",
+  "finishedAt": "2026-07-24T12:10:59.722Z",
+  "testedTree": "516ca98186b5ccd7fbfa7b513c9ca69e05d5332b",
+  "result": "passed",
+  "settings": {
+    "databaseLatencyMs": 300,
+    "edgeLatencyMs": 150,
+    "requestTimeoutMs": 5000,
+    "recoveryTimeoutMs": 15000,
+    "pollIntervalMs": 250
+  },
+  "observations": [
+    { "step": "baseline", "status": 200, "durationMs": 9, "database": "up", "migrations": "current" },
+    { "step": "database_latency", "status": 200, "durationMs": 1540, "database": "up", "migrations": "current" },
+    { "step": "database_down", "status": 503, "durationMs": 10, "database": "down", "migrations": "unknown" },
+    { "step": "database_recovery", "status": 200, "durationMs": 21, "database": "up", "migrations": "current" },
+    { "step": "edge_latency", "status": 200, "durationMs": 177, "database": "up", "migrations": "current" },
+    { "step": "edge_reset", "status": null, "durationMs": 18, "networkError": "fetch failed" },
+    { "step": "edge_recovery", "status": 200, "durationMs": 16, "database": "up", "migrations": "current" }
+  ],
+  "apiContainerAfterRecovery": {
+    "running": true,
+    "exitCode": 0,
+    "restartCount": 0
+  },
+  "logBoundary": {
+    "poolErrorFields": ["kind", "errorName", "errorCode"],
+    "connectionStringExposed": false,
+    "rawClientExposed": false
+  }
+}

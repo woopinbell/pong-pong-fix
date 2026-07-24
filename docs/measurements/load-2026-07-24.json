@@ -1,0 +1,94 @@
+{
+  "recordedAt": "2026-07-24T12:09:52.000Z",
+  "testedTree": "516ca98186b5ccd7fbfa7b513c9ca69e05d5332b",
+  "environment": {
+    "operatingSystem": "macOS 26.5.2 (25F84)",
+    "machine": "MacBook Air",
+    "cpu": "Apple M1",
+    "cpuCount": 8,
+    "memoryBytes": 17179869184,
+    "dockerVersion": "28.0.4",
+    "dockerComposeVersion": "2.34.0-desktop.1",
+    "dockerCpuCount": 8,
+    "dockerMemoryBytes": 8218316800,
+    "k6Version": "1.6.1",
+    "nodeVersion": "24.18.0"
+  },
+  "profile": {
+    "connections": 500,
+    "rooms": 50,
+    "playerConnections": 100,
+    "simulationTimestepMs": 50,
+    "snapshotIntervalMs": 100
+  },
+  "thresholds": {
+    "connectionSuccessRate": 0.99,
+    "reconnectSuccessRate": 0.99,
+    "snapshotDelayP95Ms": 150,
+    "snapshotDelayP99Ms": 250,
+    "eventLoopLagP95Ms": 50,
+    "normalSnapshotDropRate": 0.01,
+    "minimumOnlineConnections": 495,
+    "minimumActiveRooms": 50
+  },
+  "attempts": [
+    {
+      "attempt": 1,
+      "finishedAt": "2026-07-24T12:06:19.000Z",
+      "result": "did_not_meet_thresholds",
+      "durationSeconds": 93.8,
+      "metrics": {
+        "connectionSuccess": { "passed": 500, "attempted": 500, "rate": 1 },
+        "reconnectSuccess": { "passed": 96, "attempted": 100, "rate": 0.96 },
+        "onlineConnectionsMax": 500,
+        "activeRoomsMax": 50,
+        "snapshotDelayMs": { "p95": 7, "p99": 20, "max": 46 },
+        "eventLoopLagP95Ms": 26.066943,
+        "normalSnapshotDrops": { "dropped": 0, "observed": 10061, "rate": 0 },
+        "finalize": { "success": 50, "failure": 0, "duplicate": 0 },
+        "httpRequestDurationMs": { "p95": 1477.4189, "p99": 1532.04241 },
+        "websocketConnectDurationMs": { "p95": 548.70888185, "p99": 1009.95221783 }
+      },
+      "failedThresholds": ["reconnectSuccessRate"]
+    },
+    {
+      "attempt": 2,
+      "finishedAt": "2026-07-24T12:09:52.000Z",
+      "result": "did_not_meet_thresholds",
+      "durationSeconds": 94.1,
+      "metrics": {
+        "connectionSuccess": { "passed": 500, "attempted": 500, "rate": 1 },
+        "reconnectSuccess": { "passed": 95, "attempted": 100, "rate": 0.95 },
+        "onlineConnectionsMax": 500,
+        "activeRoomsMax": 50,
+        "snapshotDelayMs": { "p95": 9, "p99": 22, "max": 150 },
+        "eventLoopLagP95Ms": 26.181631,
+        "normalSnapshotDrops": { "dropped": 0, "observed": 11214, "rate": 0 },
+        "finalize": { "success": 50, "failure": 0, "duplicate": 0 },
+        "httpRequestDurationMs": { "p95": 775.3691, "p99": 827.80089 },
+        "websocketConnectDurationMs": { "p95": 2093.04530835, "p99": 2121.24567816 }
+      },
+      "serverObservation": {
+        "snapshotDeliveries": 11231,
+        "snapshotDrops": { "connectionClosed": 5 },
+        "apiContainer": { "running": true, "exitCode": 0, "restartCount": 0 }
+      },
+      "failedThresholds": ["reconnectSuccessRate"]
+    }
+  ],
+  "historicalPreFixObservation": {
+    "recordedAt": "2026-07-23T03:53:05.766Z",
+    "testedTree": "3f3412973ae65443b86697c677ff32d6397e6404",
+    "currentRerun": false,
+    "result": "failed_snapshot_drop_threshold",
+    "normalSnapshotDrops": { "dropped": 253, "observed": 9074, "rate": 0.02788186026 },
+    "serverReplacedSnapshots": 260,
+    "note": "전송 콜백 지연을 혼잡으로 판단하던 구현에서 기록한 비교값이다. 현재 실행은 실제 bufferedAmount를 기준으로 판단하며 두 번 모두 정상 연결의 순번 누락이 없었다."
+  },
+  "conclusion": {
+    "requiredProfilePassed": false,
+    "addRedis": false,
+    "addMultipleInstances": false,
+    "reason": "두 실행 모두 최초 연결, 방 수, 스냅샷 지연과 결과 확정 기준은 충족했지만 재접속 성공률이 99%에 미치지 못했다. 확인된 실패는 재접속 경로에 있으므로 분산 저장소나 다중 인스턴스를 추가할 근거로 사용하지 않는다."
+  }
+}
