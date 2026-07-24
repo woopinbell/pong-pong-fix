@@ -82,6 +82,7 @@ pnpm e2e:guest-demo
 - [운영 준비와 장애 확인](docs/operations.md)
 - [서버 구조 개선 과정](docs/case-study.md)
 - [부하·장애 주입 실행 안내](tests/load/guide.ko.md)
+- [개발 기록과 별도 학습 정리](study/README.md)
 
 ## 로컬 측정
 
